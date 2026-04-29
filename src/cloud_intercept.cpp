@@ -787,6 +787,37 @@ struct QueuedInjection {
 // Lock order: drop g_injectMutex before ProcessQueuedInjection (the call chain re-acquires via InjectResponse->enqueue).
 static std::queue<QueuedInjection*> g_injectQueue;
 static std::mutex g_injectMutex;
+// Reentrancy guard: BRouteMsgToJob resumes a coroutine that may send another packet,
+// re-entering OnSendPkt; without this we'd recurse into the drain loop.
+static thread_local bool t_drainingInjectQueue = false;
+
+static void ProcessQueuedInjection(QueuedInjection* ctx); // defined below
+
+// Drain the inject queue on the calling network thread. Safe to call from OnSendPkt
+// or RecvPktMonitorHook. Caller must already be on the network thread.
+static void DrainInjectQueueOnNetThread() {
+    if (t_drainingInjectQueue) return;
+    t_drainingInjectQueue = true;
+    static constexpr int kMaxDrainIterations = 16;
+    for (int drainIter = 0; drainIter < kMaxDrainIterations; ++drainIter) {
+        std::vector<QueuedInjection*> batch;
+        {
+            std::lock_guard<std::mutex> lock(g_injectMutex);
+            while (!g_injectQueue.empty()) {
+                batch.push_back(g_injectQueue.front());
+                g_injectQueue.pop();
+            }
+        }
+        if (batch.empty()) break;
+        for (auto* inj : batch) {
+            ProcessQueuedInjection(inj);
+        }
+        if (drainIter == kMaxDrainIterations - 1) {
+            LOG("[INJECT] WARNING: drain loop hit %d iteration limit", kMaxDrainIterations);
+        }
+    }
+    t_drainingInjectQueue = false;
+}
 
 // Process a single queued injection (called on the network thread from RecvPktMonitorHook)
 static void ProcessQueuedInjection(QueuedInjection* ctx) {
@@ -866,10 +897,13 @@ static void ProcessQueuedInjection(QueuedInjection* ctx) {
     LOG("[INJECT]   jobMgr=%p route: tgt=%llu emsg=%d flags=%d",
         jobMgr, (unsigned long long)ctx->jobIdTarget, route.emsg, route.flags);
 
-    // Pre-check: verify job still exists and is in yielding state
+    // Pre-check: verify job still exists. BRouteMsgToJob silently no-ops on a
+    // missing slot but returns 1, so we'd otherwise log a false success and the
+    // game's pending download would silently fail.
     using FindJobFn = int(__fastcall*)(void* slotMap, void* pJobId);
     FindJobFn findJob = (FindJobFn)(g_steamClientBase + SC_RVA_FIND_JOB);
     int jobSlot = -1;
+    bool findJobThrew = false;
     __try {
         void* slotMap = (void*)((uintptr_t)jobMgr + 0x200);
         jobSlot = findJob(slotMap, &route.jobidTarget);
@@ -879,10 +913,19 @@ static void ProcessQueuedInjection(QueuedInjection* ctx) {
             uint32_t jobState = cjobPtr ? *(uint32_t*)((uintptr_t)cjobPtr + 0x84) : 999;
             LOG("[INJECT]   FindJob slot=%d cjob=%p state=%u", jobSlot, cjobPtr, jobState);
         } else {
-            LOG("[INJECT]   FindJob: job not found (slot=%d) -- may have timed out", jobSlot);
+            LOG("[INJECT]   FindJob: job not found (slot=%d) -- timed out, dropping inject for %s",
+                jobSlot, ctx->methodName);
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[INJECT]   EXCEPTION in FindJob: code=0x%08X", GetExceptionCode());
+        findJobThrew = true;
+    }
+    if (jobSlot < 0 && !findJobThrew) {
+        // Drop without routing: BRouteMsgToJob would log a misleading "success" otherwise.
+        __try { g_releaseWrapped(wrappedPkt); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        VirtualFree(ctx->pktBuf, 0, MEM_RELEASE);
+        delete ctx;
+        return;
     }
 
     // Increment refcount (matches RecvPkt at 0x13859D4CC)
@@ -2185,25 +2228,8 @@ static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
     HookGuard guard;
     if (g_shuttingDown.load(std::memory_order_acquire))
         return g_originalRecvPkt(thisptr, pkt);
-    // Network-recv thread is the only one that can BRouteMsgToJob the original coroutines. Snapshot under g_injectMutex, process unlocked (resumed coroutine may re-enter InjectResponse).
-    static constexpr int kMaxDrainIterations = 16;
-    for (int drainIter = 0; drainIter < kMaxDrainIterations; ++drainIter) {
-        std::vector<QueuedInjection*> batch;
-        {
-            std::lock_guard<std::mutex> lock(g_injectMutex);
-            while (!g_injectQueue.empty()) {
-                batch.push_back(g_injectQueue.front());
-                g_injectQueue.pop();
-            }
-        }
-        if (batch.empty()) break;
-        for (auto* inj : batch) {
-            ProcessQueuedInjection(inj);
-        }
-        if (drainIter == kMaxDrainIterations - 1) {
-            LOG("[RecvMon] WARNING: injection drain loop hit %d iteration limit", kMaxDrainIterations);
-        }
-    }
+    // Drain on the network-recv thread (valid Coroutine_Continue TLS).
+    DrainInjectQueueOnNetThread();
 
     if (!pkt || !pkt->pubData || pkt->cubData < 8)
         return g_originalRecvPkt(thisptr, pkt);
@@ -3581,6 +3607,12 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
     // After Shutdown() the receive thread is gone; refuse new pushes so
     // queued buffers don't leak.
     if (g_shuttingDown.load(std::memory_order_acquire)) return false;
+
+    // Drain inject queue here too: RecvPktMonitorHook only fires on inbound packets,
+    // and an idle steamclient (e.g. game stalled at launcher waiting for save downloads)
+    // can leave responses queued long enough for Steam to time the jobs out. Outbound
+    // packets are far more frequent during the cloud-RPC bursts that fill the queue.
+    DrainInjectQueueOnNetThread();
 
     // Try to discover the real CCMInterface via CSteamEngine global.
     // This also installs the vtable hook once CCMInterface is found.
