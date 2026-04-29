@@ -2002,7 +2002,31 @@ static void InstallServiceMethodHookLocked() {
 
     // Prefer RTTI walk (build-update-tolerant); fall back to hardcoded RVA if RTTI fails. Validate slot 0 either way.
     // Resolution stays local; cache to g_serviceTransportVtableEa only on full-install success below.
+    // Reject a cached EA that doesn't belong to the current steamclient image: the
+    // module may have been unloaded and reloaded at a different base (or a fresh
+    // build with shifted layout), in which case the stale absolute pointer would
+    // patch random memory and the real vtable's slots stay un-hooked.
     uintptr_t vtableEa = g_serviceTransportVtableEa;
+    if (vtableEa) {
+        bool inRange = false;
+        __try {
+            auto base = reinterpret_cast<uint8_t*>(g_steamClientBase);
+            auto dosHdr = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (dosHdr->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto ntHdr = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dosHdr->e_lfanew);
+                if (ntHdr->Signature == IMAGE_NT_SIGNATURE) {
+                    const uintptr_t imgEnd = g_steamClientBase + ntHdr->OptionalHeader.SizeOfImage;
+                    inRange = (vtableEa >= g_steamClientBase) && (vtableEa < imgEnd);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { inRange = false; }
+        if (!inRange) {
+            LOG("[VtHook] Cached vtable EA %p outside current steamclient range (base=%p), discarding",
+                (void*)vtableEa, (void*)g_steamClientBase);
+            vtableEa = 0;
+            g_serviceTransportVtableEa = 0;
+        }
+    }
     if (!vtableEa) {
         vtableEa = ResolveServiceTransportVtableViaRtti(g_steamClientBase);
         if (vtableEa) {
@@ -3913,10 +3937,29 @@ static void ShutdownImpl() {
         if (!currentSC) {
             LOG("Shutdown: steamclient64.dll already unloaded, skipping vtable restore");
             g_vtableHookInstalled.store(false, std::memory_order_release);
+            // steamclient gone: cached EAs point into unmapped memory; clear so a
+            // subsequent re-init re-resolves against the new module image.
+            g_serviceTransportVtableEa = 0;
+            g_originalSlot4 = nullptr;
+            g_originalSlot5 = nullptr;
+            g_originalSlot7 = nullptr;
+            g_originalSlot8 = nullptr;
+            g_parseFromArray = nullptr;
+            g_serializeToArray = nullptr;
+            g_steamClientBase = 0;
         } else if ((uintptr_t)currentSC != g_steamClientBase) {
             LOG("Shutdown: steamclient64.dll base changed (%p -> %p), skipping vtable restore",
                 (void*)g_steamClientBase, (void*)currentSC);
             g_vtableHookInstalled.store(false, std::memory_order_release);
+            // Module rebased: every cached absolute pointer is wrong for the new base.
+            g_serviceTransportVtableEa = 0;
+            g_originalSlot4 = nullptr;
+            g_originalSlot5 = nullptr;
+            g_originalSlot7 = nullptr;
+            g_originalSlot8 = nullptr;
+            g_parseFromArray = nullptr;
+            g_serializeToArray = nullptr;
+            g_steamClientBase = (uintptr_t)currentSC;
         } else {
             // Restore against the same vtable EA we patched. If RTTI never resolved
             // (shouldn't be possible if g_vtableHookInstalled is true), fall back to
