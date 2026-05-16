@@ -62,8 +62,8 @@ using ParseFromArray_t   = int(*)(void* msg, const void* data, int len);
 static SerializeToArray_t g_serializeToArray = nullptr;
 static ParseFromArray_t   g_parseFromArray   = nullptr;
 
-static thread_local sigjmp_buf g_protoJmpBuf;
-static thread_local volatile sig_atomic_t g_inProtoCall = 0;
+static sigjmp_buf g_protoJmpBuf;
+static volatile sig_atomic_t g_inProtoCall = 0;
 
 static void ProtoCrashHandler(int sig) {
     if (g_inProtoCall) {

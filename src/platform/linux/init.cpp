@@ -14,7 +14,6 @@ const char* CR_GetVersion() { return CR_VERSION_STRING; }
 #include "log.h"
 
 #include <dlfcn.h>
-#include <link.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -32,7 +31,6 @@ static VtableHook::VtableInfo g_vtableInfo{};
 static VtableHook::CloudEnabledHookInfo g_cloudEnabledInfo{};
 static std::atomic<bool> g_initialized{false};
 static std::atomic<bool> g_hookAttempted{false};
-static std::atomic<bool> g_isTargetProcess{false};
 static std::atomic<bool> g_logInitialized{false};
 static pthread_t g_initThread{};
 static std::atomic<bool> g_initThreadDone{false};
@@ -40,7 +38,7 @@ static std::atomic<bool> g_initThreadDone{false};
 // Raw diagnostic logging (survives even if C++ runtime is broken)
 
 static int g_debugFd = -1;
-static thread_local char g_crashContext[192] = "none";
+static char g_crashContext[192] = "none";
 
 static void DebugLog(const char* msg)
 {
@@ -106,30 +104,30 @@ static std::string GetProcessName()
     return buf;
 }
 
-static void CleanLdAudit()
+static void CleanLdPreload()
 {
-    char* audit = getenv("LD_AUDIT");
-    if (!audit) return;
+    char* preload = getenv("LD_PRELOAD");
+    if (!preload) return;
 
-    std::string val(audit);
+    std::string val(preload);
     std::string cleaned;
     size_t pos = 0;
     while (pos < val.size())
     {
-        size_t colon = val.find(':', pos);
-        if (colon == std::string::npos) colon = val.size();
-        std::string entry = val.substr(pos, colon - pos);
-        if (entry.find("cloud_redirect") == std::string::npos)
+        size_t sep = val.find_first_of(": ", pos);
+        if (sep == std::string::npos) sep = val.size();
+        std::string entry = val.substr(pos, sep - pos);
+        if (!entry.empty() && entry.find("cloud_redirect") == std::string::npos)
         {
             if (!cleaned.empty()) cleaned += ':';
             cleaned += entry;
         }
-        pos = colon + 1;
+        pos = sep + 1;
     }
     if (cleaned.empty())
-        unsetenv("LD_AUDIT");
+        unsetenv("LD_PRELOAD");
     else
-        setenv("LD_AUDIT", cleaned.c_str(), 1);
+        setenv("LD_PRELOAD", cleaned.c_str(), 1);
 }
 
 static void DoInit()
@@ -327,11 +325,34 @@ static void InstallCrashDumpHandler()
     sigaction(SIGABRT, &sa, nullptr);
 }
 
+static bool SteamclientMapped()
+{
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "steamclient.so")) {
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static void* DeferredInitThread(void*)
 {
-    // Wait for dynamic linker to finish relocating steamclient.so
-    usleep(2000000);
-    DebugLog("[CR] DeferredInit: starting after delay\n");
+    // Poll for steamclient.so — under LD_PRELOAD we load before Steam has
+    // mapped steamclient, so a fixed delay is insufficient.
+    DebugLog("[CR] DeferredInit: waiting for steamclient.so\n");
+    for (int i = 0; i < 120; i++) {  // up to 60 seconds
+        if (SteamclientMapped()) break;
+        usleep(500000);
+    }
+    // Extra settle time for relocations to complete
+    usleep(1000000);
+    DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
     struct sigaction sa = {}, old_segv = {}, old_bus = {};
@@ -365,76 +386,29 @@ static void* DeferredInitThread(void*)
 
 
 
-extern "C" {
-
-unsigned int la_version(unsigned int version)
+__attribute__((constructor))
+static void OnLoad()
 {
-    (void)version;
-    return LAV_CURRENT;
-}
+    std::string proc = GetProcessName();
+    if (proc != "steam")
+        return;
 
-void la_preinit(uintptr_t* cookie)
-{
-    (void)cookie;
+    // Clean ourselves from LD_PRELOAD so child processes don't inherit us
+    CleanLdPreload();
 
-    // Always clean ourselves from LD_AUDIT to prevent propagation
-    CleanLdAudit();
+    EnsureLogInit();
+    DebugLog("[CR] OnLoad: target process (steam), spawning deferred init thread\n");
+    Log::Info("cloud_redirect.so active in process 'steam' (pid=%d)", getpid());
 
-    std::string procName = GetProcessName();
-    if (procName == "steam")
+    bool expected = false;
+    if (g_hookAttempted.compare_exchange_strong(expected, true))
     {
-        g_isTargetProcess.store(true, std::memory_order_release);
-        EnsureLogInit();
-        DebugLog("[CR] la_preinit: target process confirmed (steam)\n");
-        Log::Info("cloud_redirect.so active in process '%s' (pid=%d)", procName.c_str(), getpid());
-    }
-}
-
-unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie)
-{
-    (void)lmid;
-    (void)cookie;
-
-    if (!g_isTargetProcess.load(std::memory_order_acquire))
-        return 0;
-
-    if (!map || !map->l_name || !map->l_name[0])
-        return 0;
-
-    const char* name = map->l_name;
-
-    size_t len = strlen(name);
-    const char* suffix = "/steamclient.so";
-    size_t suffixLen = strlen(suffix);
-
-    bool isSteamclient = false;
-    if (len >= suffixLen && strcmp(name + len - suffixLen, suffix) == 0)
-        isSteamclient = true;
-    else if (strcmp(name, "steamclient.so") == 0)
-        isSteamclient = true;
-
-    if (isSteamclient)
-    {
-        DebugLog("[CR] la_objopen: steamclient.so detected, deferring init\n");
-        Log::Info("la_objopen: steamclient.so detected at %s", name);
-
-        // Defer init to allow dynamic linker to finish relocations
-        bool expected = false;
-        if (g_hookAttempted.compare_exchange_strong(expected, true))
-        {
-            if (pthread_create(&g_initThread, nullptr, DeferredInitThread, nullptr) != 0) {
-                DebugLog("[CR] la_objopen: FAILED to create init thread\n");
-                g_initThreadDone.store(true, std::memory_order_release);
-            }
+        if (pthread_create(&g_initThread, nullptr, DeferredInitThread, nullptr) != 0) {
+            DebugLog("[CR] OnLoad: FAILED to create init thread\n");
+            g_initThreadDone.store(true, std::memory_order_release);
         }
     }
-
-    return 0;
 }
-
-} // extern "C"
-
-
 
 __attribute__((destructor))
 static void OnUnload()
