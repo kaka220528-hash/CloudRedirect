@@ -741,6 +741,11 @@ ScanResult GetFileList(const std::string& steamPath,
             continue;
         }
 
+        // Capture rule-level root token (used as fallback when no files exist on disk).
+        if (!cloudMapping->rootToken.empty()) {
+            outResult.ruleRootTokens.insert(cloudMapping->rootToken);
+        }
+
         std::string normalizedCloudPath = ExpandAutoCloudPathTokens(NormalizeSlashes(rule.path), accountId);
         std::string normalizedScanPath = ExpandAutoCloudPathTokens(NormalizeSlashes(rule.resolvedPath), accountId);
         if (normalizedCloudPath == ".") normalizedCloudPath.clear();

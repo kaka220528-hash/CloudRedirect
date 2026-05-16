@@ -1214,7 +1214,21 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
         }
     }
     if (rootTokens.empty()) {
-        rootTokens.insert("");
+        // No stored root tokens — derive from AutoCloud rules in appinfo.vdf.
+        std::string steamPath = CloudIntercept::GetSteamPath();
+        if (!steamPath.empty()) {
+            auto scanResult = AutoCloudScan::GetFileList(steamPath, accountId, appId);
+            for (const auto& fe : scanResult.files) {
+                if (!fe.rootToken.empty()) rootTokens.insert(fe.rootToken);
+            }
+            // No files on disk — fall back to rule-level root tokens
+            if (rootTokens.empty()) {
+                rootTokens = scanResult.ruleRootTokens;
+            }
+        }
+        if (rootTokens.empty()) {
+            rootTokens.insert("");
+        }
     }
 
     for (auto& t : rootTokens) {

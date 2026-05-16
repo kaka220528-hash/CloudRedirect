@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include "autocloud_util.h"
 
 namespace AutoCloudScan {
@@ -23,6 +24,7 @@ struct FileEntry {
 
 struct ScanResult {
     std::vector<FileEntry> files;
+    std::unordered_set<std::string> ruleRootTokens;  // cloud root tokens from parsed rules (even if 0 files matched)
     bool complete = false;          // true if scan completed without truncation or collision
     bool hasRules = false;          // true if app has AutoCloud rules in appinfo.vdf
     bool hasRootCollision = false;  // true if two rules resolved to same path under different roots
