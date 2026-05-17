@@ -573,6 +573,21 @@ public partial class SetupPage : Page
     {
         if (_isRunning || _steamPath == null) return;
 
+        var host = Services.SteamDetector.DetectHost(_steamPath);
+
+        if (host == Services.HostKind.Both)
+        {
+            await Services.Dialog.ShowWarningAsync(S.Get("Setup_TwoUnlockersTitle"),
+                S.Get("Setup_TwoUnlockersMessage"));
+            return;
+        }
+
+        if (host == Services.HostKind.OpenSteamTool)
+        {
+            await RunAllOst();
+            return;
+        }
+
         var confirm = await Services.Dialog.ConfirmAsync(S.Get("Setup_RunAllPatches"),
             S.Get("Setup_ConfirmRunAll"));
 
@@ -797,6 +812,81 @@ public partial class SetupPage : Page
                 await WriteDefaultLocalConfig();
             }
         }
+
+        SetBusy(false);
+    }
+
+    private async Task RunAllOst()
+    {
+        if (_steamPath == null) return;
+
+        var confirm = await Services.Dialog.ConfirmAsync(S.Get("Setup_RunAllPatches"),
+            S.Get("Setup_ConfirmRunAllOst"));
+        if (!confirm) return;
+
+        SetBusy(true);
+        ClearLog();
+
+        await EnsureSteamClosed();
+
+        bool allOk = true;
+
+        Log("═══ " + S.Get("Setup_OstDeployHeader") + " ═══");
+        try
+        {
+            var destPath = Path.Combine(_steamPath, "cloud_redirect.dll");
+            var deployError = await Task.Run(() => EmbeddedDll.DeployTo(destPath));
+
+            if (deployError != null)
+            {
+                Log($"FAILED: {deployError}");
+                DeployStatusText.Text = S.Get("Setup_DeployFailed");
+                allOk = false;
+            }
+            else
+            {
+                var info = new FileInfo(destPath);
+                DeployStatusText.Text = S.Format("Setup_DllInstalled",
+                    info.Length.ToString("N0"), info.LastWriteTime.ToString("g"));
+                Log($"Deployed to {destPath}");
+                Log("OK");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"FAILED: {ex.Message}");
+            DeployStatusText.Text = S.Get("Setup_DeployFailed");
+            allOk = false;
+        }
+
+        Log("");
+        Log("═══ " + S.Get("Setup_OstLoaderHeader") + " ═══");
+        try
+        {
+            PatchResult? patchResult = null;
+            await Task.Run(() =>
+            {
+                patchResult = OstLoaderPatcher.Apply(_steamPath, Log);
+            });
+
+            if (patchResult?.Succeeded == true)
+            {
+                Log("OK");
+            }
+            else
+            {
+                Log($"FAILED: {patchResult?.Error ?? "Unknown error"}");
+                allOk = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"FAILED: {ex.Message}");
+            allOk = false;
+        }
+
+        Log("");
+        Log(allOk ? S.Get("Setup_OstInstallComplete") : S.Get("Setup_OstInstallFailed"));
 
         SetBusy(false);
     }
