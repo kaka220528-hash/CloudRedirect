@@ -64,6 +64,10 @@ public partial class CleanupPage : Page
         if (steamPath == null) return;
         _steamPath = steamPath;
 
+        var host = await Task.Run(() => SteamDetector.DetectHost(steamPath));
+        OstContextBanner.Visibility = host == HostKind.OpenSteamTool
+            ? Visibility.Visible : Visibility.Collapsed;
+
         var saved = LoadCleanupState(steamPath);
         if (saved == null) return;
 

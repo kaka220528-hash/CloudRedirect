@@ -14,6 +14,7 @@ namespace CloudRedirect.Pages;
 public partial class ChoiceModePage : Page
 {
     private string? _currentMode;
+    private HostKind _host;
 
     public ChoiceModePage()
     {
@@ -31,13 +32,28 @@ public partial class ChoiceModePage : Page
     // state. Resolve the mode in Task.Run, then apply visibility.
     private async Task RefreshStateAsync()
     {
-        var mode = await Task.Run(() => SteamDetector.ReadModeSetting());
+        var (mode, host) = await Task.Run(() =>
+            (SteamDetector.ReadModeSetting(), SteamDetector.DetectHost()));
+        _host = host;
         ApplyMode(mode);
     }
 
     private void ApplyMode(string? mode)
     {
         _currentMode = mode;
+
+        OstHostBanner.Visibility = _host == HostKind.OpenSteamTool
+            ? Visibility.Visible : Visibility.Collapsed;
+        NoHostBanner.Visibility = _host == HostKind.None
+            ? Visibility.Visible : Visibility.Collapsed;
+
+        if (_host == HostKind.None)
+        {
+            CurrentModeBanner.Visibility = Visibility.Collapsed;
+            STFixerCard.Visibility = Visibility.Collapsed;
+            CloudRedirectCard.Visibility = Visibility.Collapsed;
+            return;
+        }
 
         if (_currentMode != null)
         {
@@ -55,19 +71,22 @@ public partial class ChoiceModePage : Page
                 CurrentModeText.Text = S.Get("Choice_CurrentMode_STFixer");
                 CurrentModeDescription.Text = S.Get("Choice_CurrentMode_STFixer_Desc");
                 STFixerCard.Visibility = Visibility.Collapsed;
-                CloudRedirectCard.Visibility = Visibility.Visible;
+                CloudRedirectCard.Visibility = _host == HostKind.OpenSteamTool
+                    ? Visibility.Collapsed : Visibility.Visible;
             }
         }
         else
         {
             CurrentModeBanner.Visibility = Visibility.Collapsed;
-            STFixerCard.Visibility = Visibility.Visible;
+            STFixerCard.Visibility = _host == HostKind.OpenSteamTool
+                ? Visibility.Collapsed : Visibility.Visible;
             CloudRedirectCard.Visibility = Visibility.Visible;
         }
     }
 
     private async void STFixerCard_Click(object sender, MouseButtonEventArgs e)
     {
+        if (_host == HostKind.OpenSteamTool) return;
         if (_currentMode == "cloud_redirect") return;
 
         if (!await TryPersistModeAsync("stfixer", cloudRedirectEnabled: false))

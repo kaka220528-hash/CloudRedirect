@@ -16,6 +16,45 @@
                        TextWrapping="Wrap"
                        Margin="0,0,0,24" />
 
+            <!-- OST host banner (shown when OpenSteamTool detected) -->
+            <Border x:Name="OstHostBanner"
+                    Visibility="Collapsed"
+                    Background="{DynamicResource ControlFillColorDefaultBrush}"
+                    BorderBrush="{DynamicResource SystemAccentColorPrimaryBrush}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="16"
+                    Margin="0,0,0,16">
+                <StackPanel>
+                    <TextBlock Text="{res:Loc Choice_OstHost_Title}"
+                               FontSize="14" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <TextBlock Text="{res:Loc Choice_OstHost_Description}"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               TextWrapping="Wrap"
+                               Margin="0,4,0,0" />
+                </StackPanel>
+            </Border>
+
+            <Border x:Name="NoHostBanner"
+                    Visibility="Collapsed"
+                    Background="{DynamicResource ControlFillColorDefaultBrush}"
+                    BorderBrush="#CC2222"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="16"
+                    Margin="0,0,0,24">
+                <StackPanel>
+                    <TextBlock Text="{res:Loc Choice_NoHost_Title}"
+                               FontSize="14" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <TextBlock Text="{res:Loc Choice_NoHost_Description}"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               TextWrapping="Wrap"
+                               Margin="0,4,0,0" />
+                </StackPanel>
+            </Border>
+
             <!-- Current mode status (shown when mode already set) -->
             <Border x:Name="CurrentModeBanner"
                     Visibility="Collapsed"

@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
+using CloudRedirect.Resources;
 using CloudRedirect.Services;
 using Microsoft.Win32;
 
@@ -228,6 +229,18 @@ namespace CloudRedirect.Services.Patching
         {
             _verbose = true;
             var result = new PatchResult();
+
+            // xinput1_4 / dwmapi are OST's hijack DLLs; skip when OST is installed.
+            var host = SteamDetector.DetectHost(_steamPath);
+            if (host == HostKind.OpenSteamTool || host == HostKind.Both)
+            {
+                var reason = host == HostKind.Both
+                    ? S.Get("Setup_BothUnlockersLog")
+                    : S.Get("Setup_OstSkippedMessage");
+                Log(reason);
+                result.Error = reason;
+                return result;
+            }
 
             try
             {

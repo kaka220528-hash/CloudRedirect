@@ -2,9 +2,18 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using CloudRedirect.Resources;
+using CloudRedirect.Services.Patching;
 using Microsoft.Win32;
 
 namespace CloudRedirect.Services;
+
+public enum HostKind
+{
+    None,           // no supported unlocker found next to steam.exe
+    SteamTools,     // ST AES key found in xinput1_4 / dwmapi
+    OpenSteamTool,  // OST marker found in xinput1_4 / dwmapi + sidecar OpenSteamTool.dll present
+    Both,           // both fingerprints present
+}
 
 /// <summary>
 /// Detects the Steam installation path via the Windows registry or well-known paths.
@@ -100,9 +109,57 @@ public static class SteamDetector
         }
         catch
         {
-            // Version parse can fail if manifest is malformed — not critical
+            // Version parse can fail if manifest is malformed -- not critical
         }
         return null;
+    }
+
+    // OST's hijack DLL has "OpenSteamTool.dll" in .rdata for its LoadLibraryA call.
+    // CloudRedirect's autoload install rewrites it to "cr_loader.dll".
+    private static readonly byte[] _ostMarker = System.Text.Encoding.ASCII.GetBytes("OpenSteamTool.dll");
+    private static readonly byte[] _crLoaderMarker = System.Text.Encoding.ASCII.GetBytes("cr_loader.dll");
+
+    /// <summary>
+    /// Returns which unlocker is installed next to steam.exe. Not cached --
+    /// re-reads xinput1_4.dll / dwmapi.dll on each call so install changes
+    /// between calls are picked up.
+    /// </summary>
+    public static HostKind DetectHost(string? steamPath = null)
+    {
+        steamPath ??= FindSteamPath();
+        if (steamPath == null || !Directory.Exists(steamPath))
+            return HostKind.None;
+
+        bool hasOstSidecar = File.Exists(Path.Combine(steamPath, "OpenSteamTool.dll"));
+
+        bool foundSt = false;
+        bool foundOst = false;
+
+        foreach (var name in new[] { "xinput1_4.dll", "dwmapi.dll" })
+        {
+            var path = Path.Combine(steamPath, name);
+            if (!File.Exists(path)) continue;
+
+            byte[] buf;
+            try { buf = File.ReadAllBytes(path); }
+            catch { continue; }
+
+            if (Signatures.ScanForBytes(buf, 0, buf.Length, SteamToolsCrypto.AesKey) >= 0)
+                foundSt = true;
+
+            if (Signatures.ScanForBytes(buf, 0, buf.Length, _ostMarker) >= 0 ||
+                Signatures.ScanForBytes(buf, 0, buf.Length, _crLoaderMarker) >= 0)
+                foundOst = true;
+        }
+
+        // OST requires BOTH a hijack-DLL marker (pristine or patched) AND the
+        // sidecar OpenSteamTool.dll -- either alone indicates a broken install.
+        bool isOst = foundOst && hasOstSidecar;
+
+        if (foundSt && isOst) return HostKind.Both;
+        if (foundSt) return HostKind.SteamTools;
+        if (isOst) return HostKind.OpenSteamTool;
+        return HostKind.None;
     }
 
     private static string? TryRegistry()
