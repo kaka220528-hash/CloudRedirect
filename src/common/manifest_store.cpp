@@ -313,7 +313,8 @@ bool PublishManifestDeltaForCommit(uint32_t accountId, uint32_t appId,
 
     Manifest manifest;
     if (!TryLoadLocalManifest(accountId, appId, manifest)) {
-        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: no local manifest, starting from empty", appId);
+        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: no local manifest, rebuilding from local blobs", appId);
+        manifest = BuildManifestFromLocalBlobs(accountId, appId);
     }
 
     for (const auto& filename : deletes)  manifest.erase(filename);
@@ -415,15 +416,35 @@ ManifestRepairStatus RepairCloudManifest(uint32_t accountId, uint32_t appId,
 
     std::unordered_set<std::string> remoteBlobNames;
     std::unordered_map<std::string, ICloudProvider::FileInfo> remoteBlobInfo;
+    // CAS: remote blobs are SHA-addressed. Build a set of SHA hex strings
+    // present on cloud, then derive filenames from the manifest.
+    std::unordered_set<std::string> remoteBlobSHAs;
     for (const auto& fi : remoteBlobs) {
         uint32_t parsedAccountId = 0, parsedAppId = 0;
-        std::string filename;
-        if (!ParseCloudBlobPath(fi.path, parsedAccountId, parsedAppId, filename)) continue;
+        std::string leaf;
+        if (!ParseCloudBlobPath(fi.path, parsedAccountId, parsedAppId, leaf)) continue;
         if (parsedAccountId != accountId || parsedAppId != appId) continue;
-        filename = CanonicalizeInternalMetadataName(filename);
+        // CAS blobs are pure 40-char hex.
+        if (leaf.size() == 40 &&
+            leaf.find_first_not_of("0123456789abcdef") == std::string::npos) {
+            remoteBlobSHAs.insert(leaf);
+        } else {
+            // Legacy filename-addressed blob.
+            std::string filename = CanonicalizeInternalMetadataName(leaf);
+            if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
+            remoteBlobNames.insert(filename);
+            remoteBlobInfo[filename] = fi;
+        }
+    }
+    // A manifest entry whose SHA blob exists on cloud is considered present.
+    for (const auto& [filename, entry] : manifest) {
+        if (entry.sha.empty()) continue;
         if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
-        remoteBlobNames.insert(filename);
-        remoteBlobInfo[filename] = fi;
+        std::string shaHex = ShaToHex(entry.sha);
+        if (remoteBlobSHAs.count(shaHex)) {
+            remoteBlobNames.insert(filename);
+            // remoteBlobInfo not needed for CAS entries (we download by SHA path)
+        }
     }
 
     size_t repairedCount = 0;

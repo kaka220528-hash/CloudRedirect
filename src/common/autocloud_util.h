@@ -357,7 +357,7 @@ inline int CurrentWindowsVersionRank() {
     }
     return 10;
 #else
-    return -1;  // Not Windows — root overrides for Windows versions never match
+    return -1;  // Not Windows -- root overrides for Windows versions never match
 #endif
 }
 

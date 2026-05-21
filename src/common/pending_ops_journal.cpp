@@ -304,7 +304,7 @@ void RecordResumeState(uint32_t accountId, uint32_t appId,
         currentSession = Entry{};
         currentSession->machineName = "(recovered)";
     }
-    // Capture old clientId before updating — suspend writes UploadPending
+    // Capture old clientId before updating -- suspend writes UploadPending
     // entries with the pre-suspend clientId, so resume must clear both.
     uint64_t oldClientId = currentSession->clientId;
     if (clientId != 0) currentSession->clientId = clientId;

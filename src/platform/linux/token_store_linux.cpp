@@ -224,7 +224,7 @@ public:
         if (ParseTokenPath(path, provider, account)) {
             if (WriteTokenToSecretService(provider, account, json)) {
                 LOG("[TokenStorage] Stored token in Secret Service (%s)", provider.c_str());
-                // Keep the plaintext file as well — the UI checks its existence
+                // Keep the plaintext file as well -- the UI checks its existence
                 // for auth status, and it serves as a fallback if Secret Service
                 // is unavailable on next boot.
                 return WriteTokenFileFallback(path, json);

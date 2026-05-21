@@ -455,9 +455,7 @@ extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void
         return origFn(pThis, methodName, body, flags);
     }
 
-    // ExitSyncDone: let Steam's internal processing fire so it updates
-    // remotecache.vdf with the CN from BeginAppUploadBatch. The notification
-    // reaches Valve with a namespace app ID it has no record for -- harmless.
+    // ExitSyncDone: let Steam process it (updates remotecache.vdf CN).
     if (strcmp(methodName, CloudIntercept::RPC_EXIT_SYNC) == 0) {
         CR_SetCrashContext("NotificationDirect:exit-sync", methodName, appId);
         auto bodyBytes = SerializeMessage(body);
@@ -556,10 +554,8 @@ extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, un
 }
 
 // Hook: IsCloudEnabledForApp (CUserRemoteStorage vtable slot 24)
-//
 // 32-bit cdecl: bool(void* this, unsigned int appId)
-// Steam calls this to determine if cloud sync UI should be shown.
-// We return true for namespace apps to make the cloud toggle sticky.
+// Returns true for namespace apps so cloud toggle stays enabled.
 
 using IsCloudEnabledForApp_t = bool(*)(void* pThis, unsigned int appId);
 static std::atomic<IsCloudEnabledForApp_t> g_origIsCloudEnabledForApp{nullptr};

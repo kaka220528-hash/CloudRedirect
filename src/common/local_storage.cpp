@@ -103,13 +103,7 @@ static std::string GetAppPathInternal(uint32_t accountId, uint32_t appId) {
 }
 
 #ifdef CLOUDREDIRECT_TESTING
-// NOTE: These test helpers exercise the local copies of AutoCloud parsing functions
-// (ParseAppInfoKV, WildcardMatchInsensitive, ApplyRootOverridesForCurrentOS, etc.)
-// that remain in this file. Production scan code has been extracted to autocloud_scan.cpp
-// with identical implementations. These static functions are kept here because:
-// 1. They're used by other LocalStorage functions (e.g., LoadAutoCloudRules for caching)
-// 2. The test helpers verify the algorithms work correctly in isolation
-// 3. Removing them would require exposing internal helpers in the AutoCloudScan interface
+// Test helpers for the local copies of AutoCloud parsing functions.
 
 bool TestResolveAutoCloudRootOverride(const std::string& root, const std::string& path,
                                       const std::string& overrideRoot,

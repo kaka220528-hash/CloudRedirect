@@ -27,8 +27,6 @@ inline constexpr int32_t kEResultOK       = 1;
 inline constexpr int32_t kEResultDisabled = 108;
 
 // RPC response: body bytes + optional EResult override.
-// Handlers that need a non-OK EResult (e.g. session conflict) set eresult
-// explicitly; the dispatch layer writes it into the response header/flags.
 struct RpcResult {
     PB::Writer body;
     int32_t    eresult = kEResultOK;

@@ -31,17 +31,16 @@ struct ScanResult {
 };
 
 // Scan AutoCloud rules for an app and return matching files from disk.
-// steamPath: path to Steam installation root
-// accountId: Steam3 account ID (low 32 bits of SteamID64)
-// appId: Steam app ID
-//
-// Main scan entry point. Returns matched files from disk.
 ScanResult GetFileList(const std::string& steamPath,
                        uint32_t accountId, uint32_t appId);
 
 // Check if an app is installed in any Steam library folder.
 // Returns true if appmanifest_<appId>.acf exists in any library.
 bool IsAppInstalled(const std::string& steamPath, uint32_t appId);
+
+// Parse AutoCloud savefiles rules from appinfo.vdf for KV injection.
+std::vector<AutoCloudUtil::AutoCloudRuleNative> GetRules(
+    const std::string& steamPath, uint32_t appId);
 
 // Get raw rootoverrides for an app from appinfo.vdf.
 // Returns empty vector if app has no rootoverrides or appinfo can't be parsed.

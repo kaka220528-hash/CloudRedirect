@@ -379,7 +379,7 @@ void OAuthService::exchangeCodeForTokens(const QString &code, int retryCount)
         if (!self) return;
 
         if (reply->error() != QNetworkReply::NoError) {
-            // Retry once — broken IPv6 fails instantly, retry gives IPv4 a chance
+            // Retry once -- broken IPv6 fails instantly, retry gives IPv4 a chance
             if (retryCount < 2) {
                 qDebug() << "[OAuth] Token exchange failed, retrying:" << reply->errorString();
                 emit statusMessage("Retrying token exchange...");
@@ -427,7 +427,7 @@ void OAuthService::exchangeCodeForTokens(const QString &code, int retryCount)
             storeTokenInSecretService(provider, account, QString::fromUtf8(tokenJson));
         }
 
-        // Always write file — CLI and isProviderAuthenticated both rely on it
+        // Always write file -- CLI and isProviderAuthenticated both rely on it
         {
             QString dir = QFileInfo(m_tokenPath).absolutePath();
             QDir().mkpath(dir);

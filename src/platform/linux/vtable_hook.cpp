@@ -19,23 +19,17 @@ static int g_readableCount = 0;
 static struct { uintptr_t start; uintptr_t end; } g_writableRanges[64];
 static int g_writableCount = 0;
 
-// Probe an address by attempting a write() to /dev/null. Returns true if
-// the address is safely readable. Used during base discovery before
-// g_readableRanges is populated.
+// Probe readability via write() to /dev/null. Used before g_readableRanges is populated.
 static bool CanReadMemory(const void* addr, size_t len);
 
-// Walk backward from a known-good address page-by-page looking for the ELF
-// magic header. The first labeled steamclient.so mapping may start a few
-// pages into the ELF (some loaders/kernels split the first PT_LOAD across
-// labeled and unlabeled mappings), causing every computed offset to be off
-// by that gap. Anchoring on ELF magic gives us the true load base.
+// Walk backward page-by-page to find ELF magic (true load base).
+// Labeled-min may be offset into the file due to split PT_LOAD mappings.
 static uintptr_t FindElfBaseBackward(uintptr_t hint)
 {
     const long pageSize = sysconf(_SC_PAGESIZE);
     const uintptr_t pageMask = ~(uintptr_t)(pageSize - 1);
     uintptr_t page = hint & pageMask;
-    // Cap the backward walk at 64 MiB so we don't sweep the whole VA space
-    // if steamclient.so happens to start near a different module.
+    // Cap at 64 MiB backward to avoid sweeping into adjacent modules.
     const uintptr_t limit = (page > (64ULL * 1024 * 1024)) ? page - (64ULL * 1024 * 1024) : 0;
     while (page >= limit && page != 0)
     {
@@ -87,9 +81,7 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
         return 0;
     }
 
-    // Anchor base on the ELF magic. The labeled-min address may be a few
-    // pages into the actual file (anonymous initial mapping), which would
-    // shift every offset by that gap.
+    // Anchor base on ELF magic to correct for labeled-min offset.
     uintptr_t base = FindElfBaseBackward(labeledMin);
     if (base == 0)
     {
@@ -103,12 +95,9 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
                   (void*)labeledMin, (void*)base, labeledMin - base);
     }
 
-    // Capture any readable mapping within or adjacent (within 16 MiB) to the
-    // labeled steamclient.so span. Some loaders place .data.rel.ro in an
-    // anonymous mapping outside the labeled span, which the prior tight
-    // [base, end] filter would miss -- causing typeinfo pointer scans to fail.
-    // The slot-pointer bounds check below still uses the labeled span only,
-    // so widening the capture pool does not loosen vtable validation.
+    // Capture readable mappings within +/-16 MiB of labeled span.
+    // .data.rel.ro may be in anonymous mappings outside the labeled range.
+    // Slot-pointer validation still uses the tight labeled span.
     const uintptr_t adjacency = 16ULL * 1024 * 1024;
     const uintptr_t scanLo = (base > adjacency) ? base - adjacency : 0;
     const uintptr_t scanHi = labeledMax + adjacency;
@@ -146,7 +135,7 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
     return base;
 }
 
-// Safe memory probe using write() to /dev/null — avoids SIGSEGV
+// Safe memory probe using write() to /dev/null -- avoids SIGSEGV
 static bool CanReadMemory(const void* addr, size_t len)
 {
     static std::once_flag devnullOnce;
@@ -228,7 +217,7 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     uintptr_t rttiStrVaddr = rttiStrAddr - steamBase;  // file vaddr (pre-relocation value)
     Log::Debug("RTTI typestring at %p (vaddr 0x%zx)", rttiStr, (size_t)rttiStrVaddr);
 
-    // Find typeinfo: name_ptr holds raw vaddr pre-relocation, steamBase + vaddr after
+    // Find typeinfo: name_ptr is raw vaddr (unrelocated) or absolute (relocated)
     const uintptr_t* nameField = FindPointerValue(rttiStrAddr, rttiStrVaddr,
                                                   steamBase, steamSize);
     if (!nameField)
@@ -244,8 +233,7 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     Log::Debug("typeinfo at %p (vaddr 0x%zx, %s)",
                typeinfo, typeinfoAddr - steamBase, relocated ? "relocated" : "unrelocated");
 
-    // Poll until .data.rel.ro relocations are applied (all R_386_RELATIVE
-    // in the segment are processed together, so one pointer proves all done)
+    // Poll until .data.rel.ro relocations are applied
     if (!relocated)
     {
         Log::Info("Relocations pending for .data.rel.ro, waiting...");
@@ -353,7 +341,7 @@ bool VtableHook::InstallHooks(void** vtable, VtableInfo& info)
     info.origSlot7 = vtable[7];
     info.origSlot8 = vtable[8];
 
-    // The vtable lives in .data.rel.ro — need to make it writable
+    // The vtable lives in .data.rel.ro -- need to make it writable
     void* slotBase = &vtable[5];
     size_t span = reinterpret_cast<uintptr_t>(&vtable[8]) - reinterpret_cast<uintptr_t>(&vtable[5]) + 8;
 

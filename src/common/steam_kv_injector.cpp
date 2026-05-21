@@ -63,6 +63,9 @@ static constexpr uintptr_t SC_RVA_KV_SET_UINT64 = 0xD1DE40;
 // KeyValues::SetInt(kv, value)
 static constexpr uintptr_t SC_RVA_KV_SET_INT = 0xD1DE80;
 
+// KeyValues::SetString(kv, value) -- sets string value on a KV leaf node
+static constexpr uintptr_t SC_RVA_KV_SET_STRING = 0xD1DEC0;
+
 // CAppInfoUpdater::RequestAppInfoUpdate -- not yet wired (offset unconfirmed).
 // Steam's background PICS populates KV on its own schedule; cached values suffice.
 // static constexpr uintptr_t SC_RVA_REQUEST_APP_INFO = 0x4B9EA0;
@@ -77,6 +80,7 @@ using KvGetUint64Fn = uint64_t (__fastcall*)(void* kvNode, uint64_t defaultVal, 
 using KvGetIntFn = int (__fastcall*)(void* kvNode, int defaultVal, void* outStatus);
 using KvSetUint64Fn = void (__fastcall*)(void* kvNode, uint64_t value);
 using KvSetIntFn = void (__fastcall*)(void* kvNode, int value);
+using KvSetStringFn = void (__fastcall*)(void* kvNode, const char* value);
 
 struct Resolved {
     void** globalEnginePtrPtr = nullptr; // address of qword_1397A70E8 (a void**)
@@ -88,6 +92,7 @@ struct Resolved {
     KvGetIntFn       kvGetInt = nullptr;
     KvSetUint64Fn    kvSetUint64 = nullptr;
     KvSetIntFn       kvSetInt = nullptr;
+    KvSetStringFn    kvSetString = nullptr;
 };
 
 static Resolved g_r;
@@ -125,6 +130,7 @@ bool Init() {
         g_r.kvGetInt      = reinterpret_cast<KvGetIntFn>(base + SC_RVA_KV_GET_INT);
         g_r.kvSetUint64   = reinterpret_cast<KvSetUint64Fn>(base + SC_RVA_KV_SET_UINT64);
         g_r.kvSetInt      = reinterpret_cast<KvSetIntFn>(base + SC_RVA_KV_SET_INT);
+        g_r.kvSetString   = reinterpret_cast<KvSetStringFn>(base + SC_RVA_KV_SET_STRING);
 
         // Guard against wrong steamclient build -- bad RVA crashes on first call
         MEMORY_BASIC_INFORMATION mbi = {};
@@ -252,6 +258,103 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
     return true;
 }
 
+bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
+    if (!g_ready.load(std::memory_order_acquire)) return false;
+    if (rules.empty()) return false;
+
+    void* cache = GetCachePtr();
+    if (!cache) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: cache pointer null", appId);
+        return false;
+    }
+
+    void* appInfo = g_r.getAppInfo(cache, appId);
+    if (!appInfo) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: no app info entry", appId);
+        return false;
+    }
+
+    void* ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: ufs section missing", appId);
+        return false;
+    }
+
+    // Check if savefiles already exists with children. If so, don't clobber.
+    void* existing = g_r.kvFindKey(ufs, "savefiles", 0, nullptr);
+    if (existing) {
+        // KV node exists -- check if it has children by trying to find child "0"
+        void* child0 = g_r.kvFindKey(existing, "0", 0, nullptr);
+        if (child0) {
+            LOG("[KvInjector] InjectSaveFiles app=%u: savefiles already populated, skipping",
+                appId);
+            return true;
+        }
+    }
+
+    // Create or get the savefiles subsection
+    void* savefiles = g_r.kvFindKey(ufs, "savefiles", 1, nullptr);
+    if (!savefiles) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: failed to create savefiles key", appId);
+        return false;
+    }
+
+    int injected = 0;
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const auto& rule = rules[i];
+        std::string idxStr = std::to_string(i);
+
+        // Create numbered subsection: savefiles/"0", savefiles/"1", etc.
+        void* entry = g_r.kvFindKey(savefiles, idxStr.c_str(), 1, nullptr);
+        if (!entry) continue;
+
+        // Set root
+        void* rootKv = g_r.kvFindKey(entry, "root", 1, nullptr);
+        if (rootKv) g_r.kvSetString(rootKv, rule.root.c_str());
+
+        // Set path
+        if (!rule.path.empty()) {
+            void* pathKv = g_r.kvFindKey(entry, "path", 1, nullptr);
+            if (pathKv) g_r.kvSetString(pathKv, rule.path.c_str());
+        }
+
+        // Set pattern
+        void* patternKv = g_r.kvFindKey(entry, "pattern", 1, nullptr);
+        if (patternKv) g_r.kvSetString(patternKv, rule.pattern.c_str());
+
+        // Set recursive (only if true, since Steam defaults to false)
+        if (rule.recursive) {
+            void* recursiveKv = g_r.kvFindKey(entry, "recursive", 1, nullptr);
+            if (recursiveKv) g_r.kvSetInt(recursiveKv, 1);
+        }
+
+        // Set platforms (only if not all-platforms)
+        if (rule.platforms != 0xFFFFFFFFu) {
+            void* platformsKv = g_r.kvFindKey(entry, "platforms", 1, nullptr);
+            if (platformsKv) {
+                // Steam iterates "platforms" children as named strings ("windows", "macos", etc.).
+                if (rule.platforms & 1) {
+                    void* k = g_r.kvFindKey(platformsKv, "1", 1, nullptr);
+                    if (k) g_r.kvSetString(k, "windows");
+                }
+                if (rule.platforms & 2) {
+                    void* k = g_r.kvFindKey(platformsKv, "2", 1, nullptr);
+                    if (k) g_r.kvSetString(k, "macos");
+                }
+                if (rule.platforms & 8) {
+                    void* k = g_r.kvFindKey(platformsKv, "3", 1, nullptr);
+                    if (k) g_r.kvSetString(k, "linux");
+                }
+            }
+        }
+
+        ++injected;
+    }
+
+    LOG("[KvInjector] InjectSaveFiles app=%u: injected %d savefiles rules", appId, injected);
+    return injected > 0;
+}
+
 #else // !_WIN32 -- Linux 32-bit steamclient.so
 
 // Linux steamclient.so -- runtime signature scanning; falls back to hardcoded RVAs (May 2026 build)
@@ -263,6 +366,7 @@ static constexpr uintptr_t FALLBACK_RVA_GET_SECTION     = 0xF47130;
 static constexpr uintptr_t FALLBACK_RVA_KV_FIND_KEY     = 0x24CEF30;
 static constexpr uintptr_t FALLBACK_RVA_KV_SET_UINT64   = 0x24CA040;
 static constexpr uintptr_t FALLBACK_RVA_KV_SET_INT32    = 0x24CA010;
+static constexpr uintptr_t FALLBACK_RVA_KV_SET_STRING   = 0x24CA070;
 
 // Offset from CSteamEngine* to CAppInfoCache instance.
 static constexpr uintptr_t APPINFOCACHE_OFFSET = 2952; // 0xB88
@@ -280,6 +384,7 @@ using GetSectionFn   = void*(*)(void* appInfo, uint32_t sectionId);
 using KvFindKeyFn    = void*(*)(void* parent, const char* name, uint8_t bCreate, void* outArr);
 using KvSetUint64Fn  = void (*)(void* kv, uint32_t lo, uint32_t hi);
 using KvSetInt32Fn   = void (*)(void* kv, int32_t value);
+using KvSetStringFn  = void (*)(void* kv, const char* value);
 
 struct Resolved {
     void**          globalEnginePtr  = nullptr;
@@ -288,6 +393,7 @@ struct Resolved {
     KvFindKeyFn     kvFindKey        = nullptr;
     KvSetUint64Fn   kvSetUint64      = nullptr;
     KvSetInt32Fn    kvSetInt32       = nullptr;
+    KvSetStringFn   kvSetString      = nullptr;
 };
 
 static Resolved g_r;
@@ -393,19 +499,12 @@ static uintptr_t FindGlobalEnginePtr(uintptr_t textStart, uintptr_t textEnd,
         if (i < 8) continue;
         if (mem[i - 8] != 0x8D || mem[i - 7] != 0x83) continue;
 
-        // Decode the GOT-relative displacement.
-        // lea eax, [ebx + disp] where ebx = GOT base.
-        // The absolute address of the global = soBase + disp + GOT_base_relative_value.
-        // In PIC code: actual address = ebx_value + disp.
-        // But ebx_value = GOT (set up by call __x86.get_pc_thunk.bx; add ebx, <GOT-$>).
-        // The disp in the lea is (globalAddr - GOT). We need to resolve this.
+        // Found lea eax, [ebx + disp32] -- GOT-relative global address.
 
         LOG("[KvInjector] SigScan: found 'add reg, 0xB88' at 0x%lx (base+0x%lx)",
             (unsigned long)addAddr, (unsigned long)(addAddr - soBase));
 
-        // Use the fallback RVA for the global since decoding GOT-relative addressing
-        // at runtime without section headers is fragile. The add-0xB88 confirmation
-        // tells us the offset is still correct.
+        // GOT-relative decode is fragile without section headers; use fallback RVA.
         return soBase + FALLBACK_RVA_GLOBAL_ENGINE;
     }
     return 0;
@@ -466,9 +565,7 @@ static const uint8_t kMaskKvSetInt32[] = {
 static constexpr size_t kReadConfigGetSectionCallMin = 0xA0;
 static constexpr size_t kReadConfigGetSectionCallMax = 0xD0;
 
-// Extract a call target from within a function by scanning for E8 in a range
-// and verifying the target is far away (cross-module-distance implies it's the
-// right call, not a nearby helper).
+// Extract a call target by scanning for E8 in [minOff, maxOff] within funcStart.
 static uintptr_t FindCallInRange(uintptr_t funcStart, size_t minOff, size_t maxOff,
                                  uintptr_t minTarget, uintptr_t maxTarget) {
     const uint8_t* mem = reinterpret_cast<const uint8_t*>(funcStart);
@@ -505,9 +602,7 @@ bool Init() {
                 (unsigned long)readCfg, (unsigned long)(readCfg - base));
         }
 
-        // GetSection is in the same compilation unit (~10KB before ReadConfigU64).
-        // PLT thunks for libc helpers are far away (~1MB+); reject those.
-        // Constrain target to within 64KB before ReadConfigU64.
+        // GetSection: within 64KB before ReadConfigU64 (rejects far PLT thunks).
         uintptr_t getSect = 0;
         if (readCfg) {
             uintptr_t minTarget = (readCfg > 0x10000) ? readCfg - 0x10000 : ctx.textStart;
@@ -563,26 +658,36 @@ bool Init() {
                 (unsigned long)globalEng, (unsigned long)(globalEng - base));
         }
 
-        if (readCfg && getSect && kvFind && kvSetU64 && kvSetI32 && globalEng) {
+        // KvSetString: fixed offset from KvSetInt32 (0x60 in fallback RVAs).
+        uintptr_t kvSetStr = kvSetI32 ? (kvSetI32 + (FALLBACK_RVA_KV_SET_STRING - FALLBACK_RVA_KV_SET_INT32))
+                                      : 0;
+        if (kvSetStr) {
+            LOG("[KvInjector] SigScan: KvSetString at 0x%lx (base+0x%lx, derived from KvSetInt32)",
+                (unsigned long)kvSetStr, (unsigned long)(kvSetStr - base));
+        }
+
+        if (readCfg && getSect && kvFind && kvSetU64 && kvSetI32 && kvSetStr && globalEng) {
             g_r.globalEnginePtr = reinterpret_cast<void**>(globalEng);
             g_r.readConfigU64   = reinterpret_cast<ReadConfigU64Fn>(readCfg);
             g_r.getSection      = reinterpret_cast<GetSectionFn>(getSect);
             g_r.kvFindKey       = reinterpret_cast<KvFindKeyFn>(kvFind);
             g_r.kvSetUint64     = reinterpret_cast<KvSetUint64Fn>(kvSetU64);
             g_r.kvSetInt32      = reinterpret_cast<KvSetInt32Fn>(kvSetI32);
+            g_r.kvSetString     = reinterpret_cast<KvSetStringFn>(kvSetStr);
             usedSigs = true;
             LOG("[KvInjector] Init: all signatures resolved successfully");
         } else {
             LOG("[KvInjector] SigScan: FAILED (readCfg=%d getSect=%d kvFind=%d "
-                "kvSetU64=%d kvSetI32=%d global=%d) -- using fallback RVAs",
+                "kvSetU64=%d kvSetI32=%d kvSetStr=%d global=%d) -- using fallback RVAs",
                 readCfg ? 1 : 0, getSect ? 1 : 0, kvFind ? 1 : 0,
-                kvSetU64 ? 1 : 0, kvSetI32 ? 1 : 0, globalEng ? 1 : 0);
+                kvSetU64 ? 1 : 0, kvSetI32 ? 1 : 0, kvSetStr ? 1 : 0, globalEng ? 1 : 0);
             g_r.globalEnginePtr = reinterpret_cast<void**>(base + FALLBACK_RVA_GLOBAL_ENGINE);
             g_r.readConfigU64   = reinterpret_cast<ReadConfigU64Fn>(base + FALLBACK_RVA_READ_CONFIG_U64);
             g_r.getSection      = reinterpret_cast<GetSectionFn>(base + FALLBACK_RVA_GET_SECTION);
             g_r.kvFindKey       = reinterpret_cast<KvFindKeyFn>(base + FALLBACK_RVA_KV_FIND_KEY);
             g_r.kvSetUint64     = reinterpret_cast<KvSetUint64Fn>(base + FALLBACK_RVA_KV_SET_UINT64);
             g_r.kvSetInt32      = reinterpret_cast<KvSetInt32Fn>(base + FALLBACK_RVA_KV_SET_INT32);
+            g_r.kvSetString     = reinterpret_cast<KvSetStringFn>(base + FALLBACK_RVA_KV_SET_STRING);
         }
 
         LOG("[KvInjector] Init: resolved Linux pointers (engine global @ %p, sigs=%d)",
@@ -719,6 +824,94 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
             (unsigned long long)existingQuota, (unsigned long long)existingFiles);
     }
     return true;
+}
+
+bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
+    if (!g_ready.load(std::memory_order_acquire)) return false;
+    if (rules.empty()) return false;
+
+    void* cache = GetCachePtr();
+    if (!cache) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: cache pointer null", appId);
+        return false;
+    }
+
+    void* appInfo = ResolveAppInfo(cache, appId);
+    if (!appInfo) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: no app info entry", appId);
+        return false;
+    }
+
+    void* ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: ufs section missing", appId);
+        return false;
+    }
+
+    // Check if savefiles already exists with children. If so, don't clobber.
+    void* existing = g_r.kvFindKey(ufs, "savefiles", 0, nullptr);
+    if (existing) {
+        void* child0 = g_r.kvFindKey(existing, "0", 0, nullptr);
+        if (child0) {
+            LOG("[KvInjector] InjectSaveFiles app=%u: savefiles already populated, skipping",
+                appId);
+            return true;
+        }
+    }
+
+    void* savefiles = g_r.kvFindKey(ufs, "savefiles", 1, nullptr);
+    if (!savefiles) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: failed to create savefiles key", appId);
+        return false;
+    }
+
+    int injected = 0;
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const auto& rule = rules[i];
+        std::string idxStr = std::to_string(i);
+
+        void* entry = g_r.kvFindKey(savefiles, idxStr.c_str(), 1, nullptr);
+        if (!entry) continue;
+
+        void* rootKv = g_r.kvFindKey(entry, "root", 1, nullptr);
+        if (rootKv) g_r.kvSetString(rootKv, rule.root.c_str());
+
+        if (!rule.path.empty()) {
+            void* pathKv = g_r.kvFindKey(entry, "path", 1, nullptr);
+            if (pathKv) g_r.kvSetString(pathKv, rule.path.c_str());
+        }
+
+        void* patternKv = g_r.kvFindKey(entry, "pattern", 1, nullptr);
+        if (patternKv) g_r.kvSetString(patternKv, rule.pattern.c_str());
+
+        if (rule.recursive) {
+            void* recursiveKv = g_r.kvFindKey(entry, "recursive", 1, nullptr);
+            if (recursiveKv) g_r.kvSetInt32(recursiveKv, 1);
+        }
+
+        if (rule.platforms != 0xFFFFFFFFu) {
+            void* platformsKv = g_r.kvFindKey(entry, "platforms", 1, nullptr);
+            if (platformsKv) {
+                if (rule.platforms & 1) {
+                    void* k = g_r.kvFindKey(platformsKv, "1", 1, nullptr);
+                    if (k) g_r.kvSetString(k, "windows");
+                }
+                if (rule.platforms & 2) {
+                    void* k = g_r.kvFindKey(platformsKv, "2", 1, nullptr);
+                    if (k) g_r.kvSetString(k, "macos");
+                }
+                if (rule.platforms & 8) {
+                    void* k = g_r.kvFindKey(platformsKv, "3", 1, nullptr);
+                    if (k) g_r.kvSetString(k, "linux");
+                }
+            }
+        }
+
+        ++injected;
+    }
+
+    LOG("[KvInjector] InjectSaveFiles app=%u: injected %d savefiles rules", appId, injected);
+    return injected > 0;
 }
 
 #endif // _WIN32

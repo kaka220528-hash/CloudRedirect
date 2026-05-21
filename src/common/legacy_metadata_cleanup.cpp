@@ -139,10 +139,7 @@ std::vector<fs::path> ListNumericSubdirs(const fs::path& parent) {
     if (ec) return out;
     while (it != end) {
         std::error_code entryEc;
-        // symlink_status: reparse points at the account/app level are
-        // unexpected and we refuse to recurse through them. A real numeric-
-        // named directory symlink is exotic enough that ignoring it is the
-        // safer default.
+        // symlink_status: skip symlinks at account/app level.
         auto st = it->symlink_status(entryEc);
         if (!entryEc && !fs::is_symlink(st) && fs::is_directory(st)) {
             const std::string name = it->path().filename().string();

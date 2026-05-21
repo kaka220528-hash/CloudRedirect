@@ -934,6 +934,18 @@ ScanResult GetFileList(const std::string& steamPath,
     return outResult;
 }
 
+// GetRules: parsed savefiles rules for KV injection.
+
+std::vector<AutoCloudUtil::AutoCloudRuleNative> GetRules(
+    const std::string& steamPath, uint32_t appId) {
+    // Use current platform (injection only needs rule structure, not Proton awareness).
+    AutoCloudEffectivePlatform platform = AutoCloudEffectivePlatform::Current;
+#ifndef _WIN32
+    platform = DetectEffectivePlatform(steamPath, appId, 0);
+#endif
+    return LoadAutoCloudRules(steamPath, appId, platform);
+}
+
 // ============================================================================
 // GetRootOverrides - exposes raw rootoverrides for cross-platform mapping
 // ============================================================================

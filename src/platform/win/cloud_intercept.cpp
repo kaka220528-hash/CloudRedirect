@@ -159,7 +159,7 @@ using NotificationSlot8Fn = bool(__fastcall*)(void* thisptr, const char* methodN
 //   rdx = raw data pointer
 //   r8  = raw data size (as int)
 using ParseFromArrayFn = char(__fastcall*)(void* msgBody, const char* data, int size);
-// sub_138BD07E0: SerializeToArray ΓÇö writes protobuf message to a buffer
+// sub_138BD07E0: SerializeToArray -- writes protobuf message to a buffer
 //   rcx = protobuf message object
 //   rdx = output buffer pointer
 //   r8  = buffer size (int)
@@ -1759,7 +1759,7 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
 
     // ExitSyncDone: let Steam's internal processing fire so it updates
     // remotecache.vdf with the CN from BeginAppUploadBatch. The notification
-    // reaches Valve with a namespace app ID it has no record for ΓÇö harmless.
+    // reaches Valve with a namespace app ID it has no record for -- harmless.
     if (strcmp(methodName, RPC_EXIT_SYNC) == 0) {
         auto bodyBytes = SerializeBodyToBytes(bodyObj);
         auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -1773,7 +1773,7 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         if (accountId != 0) {
             PendingOpsJournal::RecordExitSyncState(accountId, realAppId,
                 uploadsCompleted, uploadsRequired, clientId);
-            // Release cloud session lock ΓÇö server-faithful: sync done, release ownership.
+            // Release cloud session lock -- server-faithful: sync done, release ownership.
             CloudStorage::ReleaseCloudSession(accountId, realAppId, clientId);
         }
         if (!g_shuttingDown.load(std::memory_order_acquire)) {
@@ -1823,7 +1823,7 @@ static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodN
 
     // ExitSyncDone: let Steam's internal processing fire so it updates
     // remotecache.vdf with the CN from BeginAppUploadBatch. The notification
-    // reaches Valve with a namespace app ID it has no record for ΓÇö harmless.
+    // reaches Valve with a namespace app ID it has no record for -- harmless.
     if (strcmp(methodName, RPC_EXIT_SYNC) == 0) {
         auto bodyBytes = SerializeBodyToBytes(bodyObj);
         auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -1839,7 +1839,7 @@ static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodN
                 uploadsCompleted, uploadsRequired, clientId);
             // ReleaseCloudSession and stats/playtime upload handled by slot 8
             // (NotificationWrapperHook). Slot 7 is a cascade from the same
-            // notification — don't duplicate cloud I/O.
+            // notification -- don't duplicate cloud I/O.
         }
         LOG("[VtHook-Notif] %s app=%u (direct): cascade from slot 8, passing through", methodName, realAppId);
         return g_originalSlot7(thisptr, methodName, bodyObj, flags);
@@ -4099,8 +4099,7 @@ void InstallManifestPinHook() {
 }
 
 void InstallReleaseStateNop() {
-    // Intentionally empty ΓÇö release-state patching removed from public builds.
-    // Kept as a stub so callers don't need to be changed.
+    // Stub -- release-state patching removed from public builds.
 }
 
 void SetSendPktAddr(void* recvPktGlobalAddr) {
@@ -4433,7 +4432,7 @@ static void ShutdownImpl() {
     // Restore vtable pointers before DLL unload, but skip if steamclient64
     // is gone (Steam's clean exit FreeLibrarys it before ExitProcess; the
     // cached base then points at unmapped memory and VirtualProtect 487s).
-    // Also skip if hook drain timed out ΓÇö restoring slots with hooks in-flight
+    // Also skip if hook drain timed out -- restoring slots with hooks in-flight
     // risks control-flow corruption.
     if (!hookDrainTimedOut && g_vtableHookInstalled.load(std::memory_order_acquire) && g_steamClientBase) {
         HMODULE currentSC = GetModuleHandleA("steamclient64.dll");

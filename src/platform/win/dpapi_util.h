@@ -1,8 +1,6 @@
 #pragma once
 // DPAPI helpers for encrypting/decrypting token files.
 // Uses CryptProtectData/CryptUnprotectData (user-scope, no extra entropy).
-// Both the DLL (inside Steam) and the UI run as the same Windows user,
-// so tokens encrypted by one can be decrypted by the other.
 
 #include <string>
 #include <vector>
@@ -85,7 +83,7 @@ inline std::string ReadTokenFile(const std::string& path, bool reencrypt = true)
             auto blob = Encrypt(raw);
             if (!blob.empty()) {
                 FileUtil::AtomicWriteBinary(path, blob.data(), blob.size());
-            } // else: DPAPI encryption failed — leave plaintext in place (non-critical)
+            } // else: DPAPI encryption failed -- leave plaintext in place (non-critical)
         }
         return raw;
     }

@@ -107,6 +107,27 @@ static uint32_t ClampFileSizeToUint32(uint64_t rawSize, const char* fieldName,
     return static_cast<uint32_t>(rawSize);
 }
 
+// Per-app diagnostic gate. Hardcoded to ULTRAKILL (1229490) for debugging.
+static bool DiagEnabledForApp(uint32_t appId) {
+    (void)appId;
+    return true;
+}
+
+static void DiagHexDump(const char* tag, uint32_t appId,
+                        const uint8_t* data, size_t len) {
+    if (!DiagEnabledForApp(appId)) return;
+    LOG("[DIAG] %s app=%u bytes=%zu", tag, appId, len);
+    char hexLine[200];
+    for (size_t off = 0; off < len; off += 32) {
+        int pos = 0;
+        size_t end = (off + 32 < len) ? off + 32 : len;
+        for (size_t i = off; i < end; i++) {
+            pos += snprintf(hexLine + pos, sizeof(hexLine) - pos, "%02X ", data[i]);
+        }
+        LOG("[DIAG] %s app=%u +%04X: %s", tag, appId, (unsigned)off, hexLine);
+    }
+}
+
 static void InvalidateTokenCaches(uint32_t accountId, uint32_t appId);
 
 static void SetRpcCrashContext(const char* phase, const char* method, uint32_t appId) {
@@ -192,16 +213,8 @@ static std::mutex g_batchCanonicalTokensMutex;
 // Serializes token load-merge-save cycles.
 static std::mutex g_tokenCaptureMutex;
 
-// For "namespace" apps (family-shared or otherwise non-owned), Steam may
-// never receive PICS data. When that happens, the client reads its KV
-// tree for section "ufs". For non-owned apps, PICS doesn't return these
-// fields, the defaults are 0, and every file is evicted as "over quota."
-//
-// We compensate by:
-//   1. Checking whether Steam already has values (its own PICS run). If so,
-//      cache them to cloud state for future sessions.
-//   2. Otherwise injecting from our cached PICS values (persisted in
-//      state.cloudredirect), or a generous fallback if no cache exists.
+// Namespace apps may lack PICS data (ufs.quota/maxnumfiles default to 0,
+// causing over-quota eviction). Inject cached PICS values or fallback.
 static constexpr uint64_t kFallbackQuotaBytes = 1073741824ULL; // 1 GB
 static constexpr uint32_t kFallbackMaxFiles   = 10000;
 
@@ -255,6 +268,48 @@ static bool EnsureAppQuotaInjected(uint32_t accountId, uint32_t appId,
         source, (unsigned long long)injectQuota, injectFiles);
 
     return SteamKvInjector::InjectAppQuota(appId, injectQuota, injectFiles);
+}
+
+// Track apps that received a full manifest this session. Subsequent calls
+// return empty delta to avoid stale SHA/timestamp conflicts on AC Exit.
+static std::unordered_set<uint32_t> g_fullManifestSentApps;
+static std::mutex g_fullManifestSentMutex;
+
+// Inject savefiles rules so AC exit-sync builds a valid file-root tree.
+// Without this, namespace apps get all files deleted ("no longer matches patterns").
+static std::unordered_set<uint32_t> g_saveFilesInjected;
+static std::mutex g_saveFilesInjectedMutex;
+
+static void EnsureSaveFilesInjected(uint32_t appId) {
+    {
+        std::lock_guard<std::mutex> lock(g_saveFilesInjectedMutex);
+        if (g_saveFilesInjected.count(appId)) return;
+    }
+
+    if (!SteamKvInjector::IsReady()) return;
+
+    std::string steamPath = CloudIntercept::GetSteamPath();
+    if (steamPath.empty()) return;
+
+    auto rules = AutoCloudScan::GetRules(steamPath, appId);
+    if (rules.empty()) return;
+
+    std::vector<SteamKvInjector::SaveFileRule> kvRules;
+    kvRules.reserve(rules.size());
+    for (const auto& r : rules) {
+        SteamKvInjector::SaveFileRule sr;
+        sr.root = r.root;
+        sr.path = r.path;
+        sr.pattern = r.pattern;
+        sr.recursive = r.recursive;
+        sr.platforms = r.platforms;
+        kvRules.push_back(std::move(sr));
+    }
+
+    if (SteamKvInjector::InjectSaveFiles(appId, kvRules)) {
+        std::lock_guard<std::mutex> lock(g_saveFilesInjectedMutex);
+        g_saveFilesInjected.insert(appId);
+    }
 }
 
 // g_lastVerifiedCN removed -- session lock in unified state file prevents concurrent writes.
@@ -958,6 +1013,18 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     auto* cnField = PB::FindField(reqBody, 2);
     uint64_t clientChangeNumber = cnField ? cnField->varintVal : 0;
 
+    if (DiagEnabledForApp(appId)) {
+        // Decode req fields (1=appid, 2=synced_change_number) and dump anything else.
+        LOG("[DIAG] GetAppFileChangelist req app=%u synced_change_number=%llu fields=%zu",
+            appId, (unsigned long long)clientChangeNumber, reqBody.size());
+        for (const auto& f : reqBody) {
+            if (f.fieldNum != 1 && f.fieldNum != 2) {
+                LOG("[DIAG] GetAppFileChangelist req app=%u unknown field tag=%u wire=%d",
+                    appId, f.fieldNum, (int)f.wireType);
+            }
+        }
+    }
+
     uint32_t accountId = 0;
     SetRpcCrashContext("GetChangelist:account", "Cloud.GetAppFileChangelist#1", appId);
     if (!RequireAccountId("GetAppFileChangelist", appId, accountId)) {
@@ -1018,10 +1085,12 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         }
     }
 
-    // Inject quota into Steam's KV -- uses cached PICS from cloud state when
-    // available so we inject real values instead of the hardcoded fallback.
+    // Inject quota (cached PICS values or fallback).
     EnsureAppQuotaInjected(accountId, appId,
                            haveFetchedState ? &fetchedState : nullptr);
+
+    // Inject savefiles rules for namespace apps missing PICS data.
+    EnsureSaveFilesInjected(appId);
 
     if (!haveCloudManifest) {
         SetRpcCrashContext("GetChangelist:local-fallback", "Cloud.GetAppFileChangelist#1", appId);
@@ -1111,37 +1180,27 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             }
             LOG("[NS-CL] GetAppFileChangelist app=%u delta clientCN=%llu serverCN=%llu (%zu changed)",
                 appId, clientChangeNumber, cloudCN, files.size());
-        } else if (clientChangeNumber == cloudCN) {
-            serverChangeNumber = cloudCN;
-            responseIsDelta = true;
-            for (const auto& [filename, entry] : cloudManifest) {
-                if (IsReservedBlobFilename(filename)) continue;
-                auto local = LocalStorage::GetFileEntry(accountId, appId, filename);
-                if (local && local->sha == entry.sha) continue;
-                LocalStorage::FileEntry fe;
-                fe.filename = filename;
-                fe.sha = local ? local->sha : entry.sha;
-                fe.timestamp = local ? local->timestamp : entry.timestamp;
-                fe.rawSize = local ? local->rawSize : entry.size;
-                fe.deleted = false;
-                files.push_back(std::move(fe));
-            }
-            LOG("[NS-CL] GetAppFileChangelist app=%u: same CN=%llu, %zu files changed locally",
-                appId, cloudCN, files.size());
         } else {
-            // No delta and CNs differ. Check if snapshot exists at clientCN
-            // (baseline present, no file changes) vs snapshot missing (first sync).
-            bool snapshotExists = CloudStorage::ManifestSnapshotExists(accountId, appId, clientChangeNumber);
-            if (snapshotExists) {
-                // Baseline existed and files didn't change -- already synced.
-                serverChangeNumber = cloudCN;
+            // No delta. First call: full manifest (populates root tokens).
+            // Subsequent calls: empty delta (avoids stale SHA/timestamp conflicts).
+            bool alreadySentFull;
+            {
+                std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
+                alreadySentFull = g_fullManifestSentApps.count(appId) > 0;
+            }
+
+            serverChangeNumber = cloudCN;
+
+            if (alreadySentFull) {
+                // Subsequent call: empty delta.
                 responseIsDelta = true;
-                LOG("[NS-CL] GetAppFileChangelist app=%u: no changes since clientCN=%llu, synced at CN=%llu",
-                    appId, clientChangeNumber, cloudCN);
+                LOG("[NS-CL] GetAppFileChangelist app=%u: already sent full manifest this session, returning empty delta at CN=%llu",
+                    appId, cloudCN);
             } else {
-                // No delta and CNs differ: snapshot missing at clientCN (first sync).
-                serverChangeNumber = cloudCN;
+                // First call: full manifest. Use cloud timestamp so subsequent
+                // compares see the same remotetime (avoids false conflicts).
                 responseIsDelta = false;
+
                 for (const auto& [filename, entry] : cloudManifest) {
                     if (IsReservedBlobFilename(filename)) continue;
                     LocalStorage::FileEntry fe;
@@ -1152,8 +1211,13 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                     fe.deleted = false;
                     files.push_back(std::move(fe));
                 }
-                LOG("[NS-CL] GetAppFileChangelist app=%u using cloud manifest (%zu files)",
-                    appId, files.size());
+
+                {
+                    std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
+                    g_fullManifestSentApps.insert(appId);
+                }
+                LOG("[NS-CL] GetAppFileChangelist app=%u: returning full manifest (%zu files) at CN=%llu (clientCN=%llu)",
+                    appId, files.size(), cloudCN, clientChangeNumber);
             }
         }
     } else {
@@ -1384,6 +1448,22 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
 
     LOG("[NS-CL] Response: %zu files, %zu prefixes, CN=%llu",
         prepared.size(), prefixList.size(), serverChangeNumber);
+
+    if (DiagEnabledForApp(appId)) {
+        LOG("[DIAG] GetAppFileChangelist resp app=%u CN=%llu is_only_delta=%d files=%zu prefixes=%zu",
+            appId, (unsigned long long)serverChangeNumber, responseIsDelta ? 1 : 0,
+            prepared.size(), prefixList.size());
+        for (size_t i = 0; i < prefixList.size(); ++i) {
+            LOG("[DIAG] GetAppFileChangelist resp app=%u prefix[%zu]='%s'",
+                appId, i, prefixList[i].c_str());
+        }
+        for (const auto& pf : prepared) {
+            LOG("[DIAG] GetAppFileChangelist resp app=%u file leaf='%s' prefix_idx=%u",
+                appId, pf.leaf.c_str(), pf.prefixIdx);
+        }
+        const auto& ourData = body.Data();
+        DiagHexDump("GetAppFileChangelist resp", appId, ourData.data(), ourData.size());
+    }
 
 #ifdef DEBUG_HEX_DUMP
     {
@@ -1747,7 +1827,8 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
         return body;
     }
     EnsureAppQuotaInjected(accountId, appId, nullptr);
-    
+    EnsureSaveFilesInjected(appId);
+
     if (CloudStorage::IsCloudActive()) {
         uint32_t asyncAcct = accountId;
         uint32_t asyncApp = appId;
@@ -1778,6 +1859,10 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
     PB::Writer body;
     bool sessionConflict = false;
     if (CloudStorage::IsCloudActive()) {
+        // Sync mutex: serialize state RMW to prevent interleaved publishes.
+        auto syncMtx = CloudStorage::AcquireAppSyncMutex(accountId, appId);
+        std::lock_guard<std::mutex> syncLock(*syncMtx);
+
         auto stateResult = CloudStorage::FetchCloudState(accountId, appId);
         if (stateResult.status == CloudStorage::StateFetchStatus::Ok) {
             auto& state = stateResult.state;
@@ -1785,10 +1870,8 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
 
             if (state.hasActiveSession() &&
                 state.session.clientId != currentSession.clientId) {
-                // Another machine holds the session lock.
-                // No stale timeout -- Steam shows the conflict dialog regardless
-                // of session age. "Play Anyway" (ignore_pending_operations=true)
-                // is the recovery path for crashed/orphaned sessions.
+                // Another machine holds the session lock. Steam shows conflict dialog;
+                // "Play Anyway" (ignore_pending_operations) overrides orphaned sessions.
                 LOG("[NS] LaunchIntent app=%u: another session active (machine=%s, client=%llu, age=%llus)",
                     appId, state.session.machineName.c_str(),
                     state.session.clientId,
@@ -1804,13 +1887,14 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
                     // Steam expects EResult=108 to trigger the conflict UI.
                     sessionConflict = true;
                 } else {
-                    // User chose "play anyway" -- acquire the lock, overriding
-                    // the other session.
+                    // "Play anyway" -- override stale session.
                     state.session.clientId = currentSession.clientId;
                     state.session.machineName = currentSession.machineName;
                     state.session.timeLastUpdated = now;
                     state.session.operation = "active";
-                    CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag);
+                    if (!CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag)) {
+                        LOG("[NS] LaunchIntent app=%u: session override publish failed (best-effort)", appId);
+                    }
                     LOG("[NS] LaunchIntent app=%u: forced session override (machine=%s, client=%llu)",
                         appId, currentSession.machineName.c_str(), currentSession.clientId);
                 }
@@ -1819,7 +1903,9 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
                 state.session.machineName = currentSession.machineName;
                 state.session.timeLastUpdated = now;
                 state.session.operation = "active";
-                CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag);
+                if (!CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag)) {
+                    LOG("[NS] LaunchIntent app=%u: session acquire publish failed (best-effort)", appId);
+                }
                 LOG("[NS] LaunchIntent app=%u: acquired session (machine=%s, client=%llu)",
                     appId, currentSession.machineName.c_str(), currentSession.clientId);
             }
@@ -1936,11 +2022,20 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
     PrepareBatchCanonicalTokens(accountId, appId);
     PendingOpsJournal::RecordUploadBatchStart(accountId, appId);
 
+    if (DiagEnabledForApp(appId)) {
+        LOG("[DIAG] BeginAppUploadBatch req app=%u currentCN=%llu fields=%zu",
+            appId, (unsigned long long)currentCN, reqBody.size());
+    }
+
     int uploadCount = 0, deleteCount = 0;
     for (auto& f : reqBody) {
         if (f.fieldNum == 3 && f.wireType == PB::LengthDelimited) {
             std::string name(reinterpret_cast<const char*>(f.data), f.dataLen);
             LOG("[NS-BATCH]   upload: %s", SanitizeForLog(name).c_str());
+            if (DiagEnabledForApp(appId)) {
+                LOG("[DIAG] BeginAppUploadBatch req app=%u upload_raw='%s' (len=%u)",
+                    appId, SanitizeForLog(name).c_str(), f.dataLen);
+            }
             TryCaptureRootToken(accountId, appId,
                 CanonicalizeUploadRootToken(accountId, appId, StripRootToken(name), ExtractRootToken(name)));
             ++uploadCount;
@@ -1948,6 +2043,10 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
         if (f.fieldNum == 4 && f.wireType == PB::LengthDelimited) {
             std::string name(reinterpret_cast<const char*>(f.data), f.dataLen);
             LOG("[NS-BATCH]   delete: %s", SanitizeForLog(name).c_str());
+            if (DiagEnabledForApp(appId)) {
+                LOG("[DIAG] BeginAppUploadBatch req app=%u delete_raw='%s' (len=%u)",
+                    appId, SanitizeForLog(name).c_str(), f.dataLen);
+            }
             TryCaptureRootToken(accountId, appId,
                 CanonicalizeUploadRootToken(accountId, appId, StripRootToken(name), ExtractRootToken(name)));
             ++deleteCount;
@@ -2145,10 +2244,7 @@ RpcResult HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& r
         }
 
     } else {
-        // Don't delete blobs on transfer failure -- if the PUT truly failed,
-        // no blob was written. If another concurrent PUT for the same file
-        // succeeded, deleting here would destroy valid data. Orphaned blobs
-        // from genuinely partial PUTs are cleaned up at batch completion.
+        // Don't delete blobs on transfer failure -- orphans are cleaned at batch completion.
         LOG("[NS-UP]   transfer failed for %s, skipping blob cleanup (concurrent PUT may have succeeded)",
             cleanName.c_str());
     }
@@ -2213,6 +2309,10 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
 
     uint64_t newCN = batch.assignedCN;
     {
+        // Sync mutex: serialize CN set + state publish.
+        auto syncMtx = CloudStorage::AcquireAppSyncMutex(accountId, appId);
+        std::lock_guard<std::mutex> syncLock(*syncMtx);
+
         CloudStorage::CloudAppState state;
         auto localManifest = CloudStorage::LoadLocalManifest(accountId, appId);
         for (const auto& [name, me] : localManifest) {
@@ -2255,9 +2355,28 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
         CloudStorage::SaveManifestLocal(accountId, appId, updatedManifest);
         CloudStorage::SaveManifestSnapshot(accountId, appId, newCN);
 
-        // Synchronous -- must finish before ExitSyncDone races with ReleaseCloudSession
+        // Synchronous first attempt (must finish before ExitSyncDone).
+        // Steam ignores CompleteBatch eresult, so retry async on failure.
         if (!CloudStorage::PublishCloudState(accountId, appId, state)) {
-            LOG("[NS] CompleteBatch: state publish failed for app %u", appId);
+            LOG("[NS] CompleteBatch: state publish failed for app %u; scheduling async retry", appId);
+            auto stateCopy = std::make_shared<CloudStorage::CloudAppState>(state);
+            std::thread([stateCopy, accountId, appId] {
+                constexpr int kMaxRetries = 3;
+                constexpr int kBaseDelayMs = 2000;
+                for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(kBaseDelayMs * attempt));
+                    if (CloudStorage::PublishCloudState(accountId, appId, *stateCopy)) {
+                        LOG("[NS] CompleteBatch: async retry %d/%d succeeded for app %u",
+                            attempt, kMaxRetries, appId);
+                        return;
+                    }
+                    LOG("[NS] CompleteBatch: async retry %d/%d failed for app %u",
+                        attempt, kMaxRetries, appId);
+                }
+                LOG("[NS] CompleteBatch: all retries exhausted for app %u; "
+                    "remote state stale until next sync", appId);
+            }).detach();
         }
     }
 
@@ -2266,6 +2385,12 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
     LOG("[NS] CompleteBatch app=%u CN=%llu (state published atomically)", appId, newCN);
 
     ClearBatchCanonicalTokens(accountId, appId);
+
+    // Fire-and-forget GC after successful commit.
+    std::thread([accountId, appId]() {
+        CloudStorage::GarbageCollectBlobs(accountId, appId);
+    }).detach();
+
     PB::Writer body; // empty response
     return body;
 }

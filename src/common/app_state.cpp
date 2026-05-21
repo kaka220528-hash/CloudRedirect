@@ -199,29 +199,8 @@ StateFetchResult FetchCloudState(uint32_t accountId, uint32_t appId) {
             LOG("[AppState] FetchCloudState app %u: parse failed", appId);
             return { StateFetchStatus::ParseFailed, {}, {} };
         }
-        // CN > 0 with empty manifest = broken state; rebuild from cloud blobs
-        if (state.cn > 0 && state.files.empty() && g_stateProvider) {
-            std::string blobPrefix = std::to_string(accountId) + "/" +
-                                     std::to_string(appId) + "/blobs/";
-            std::vector<ICloudProvider::FileInfo> remoteBlobs;
-            bool complete = false;
-            if (g_stateProvider->ListChecked(blobPrefix, remoteBlobs, &complete) && complete) {
-                for (const auto& fi : remoteBlobs) {
-                    std::string filename = fi.path.substr(blobPrefix.size());
-                    if (filename.empty() || CloudIntercept::IsReservedBlobFilename(filename))
-                        continue;
-                    FileEntry fe;
-                    fe.size = fi.size;
-                    fe.timestamp = fi.modifiedTime;
-                    state.files[filename] = std::move(fe);
-                }
-            }
-            if (!state.files.empty()) {
-                LOG("[AppState] FetchCloudState app %u: repaired empty state from cloud (%zu files)",
-                    appId, state.files.size());
-                PublishCloudState(accountId, appId, state);
-            }
-        }
+        // cn>0 with empty files is valid (user deleted all saves).
+        // AutoCloudImport repopulates from disk if local files exist.
         LOG("[AppState] FetchCloudState app %u: loaded state CN=%llu, %zu files",
             appId, state.cn, state.files.size());
         return { StateFetchStatus::Ok, std::move(state), {} };
@@ -326,13 +305,19 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
 }
 
 void ReleaseCloudSession(uint32_t accountId, uint32_t appId, uint64_t clientId) {
+    // Sync mutex: serialize state RMW to prevent interleaved publishes.
+    auto syncMtx = AcquireAppSyncMutex(accountId, appId);
+    std::lock_guard<std::mutex> syncLock(*syncMtx);
+
     auto result = FetchCloudState(accountId, appId);
     if (result.status != StateFetchStatus::Ok) return;
 
     auto& state = result.state;
     if (state.session.clientId == clientId || clientId == 0) {
         state.session = {};
-        PublishCloudState(accountId, appId, state, result.etag);
+        if (!PublishCloudState(accountId, appId, state, result.etag)) {
+            LOG("[AppState] ReleaseCloudSession app %u: publish failed (best-effort)", appId);
+        }
         LOG("[AppState] ReleaseCloudSession app %u: session cleared (client=%llu)",
             appId, clientId);
     }

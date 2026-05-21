@@ -115,7 +115,7 @@ static void Notify(const char* msg, bool critical = false)
             execlp("notify-send", "notify-send", "-t", "5000", "-u", "normal", "CloudRedirect", msg, nullptr);
         _exit(1);
     }
-    // Parent: don't wait — reap asynchronously via SIGCHLD (default ignore)
+    // Parent: don't wait -- reap asynchronously via SIGCHLD (default ignore)
 }
 
 static std::string GetProcessName()
@@ -216,10 +216,7 @@ static void DoInit()
     DebugLog("[CR] DoInit: resolving protobuf helpers\n");
     CloudHooks::ResolveProtobufHelpers(reinterpret_cast<void*>(steamBase), steamSize);
 
-    // Sweep stray *.cloudredirect metadata that older DLL builds or SteamTools'
-    // cloud sync may have pulled into Steam's userdata/{app}/remote/.  The
-    // current build never writes there; matching files are contamination that
-    // pollutes AutoCloud's per-app file inventory.
+    // Sweep stray *.cloudredirect metadata from userdata/{app}/remote/.
     {
         std::string steamPath = CloudIntercept::GetSteamPath();
         if (!steamPath.empty())
@@ -243,7 +240,7 @@ static void ScanCrashHandler(int sig)
 {
     if (g_inScan)
         siglongjmp(g_crashJmpBuf, 1);
-    // Not our crash — SA_RESETHAND already restored default, just re-raise
+    // Not our crash -- SA_RESETHAND already restored default, just re-raise
     raise(sig);
 }
 
@@ -372,7 +369,7 @@ static bool SteamclientMapped()
 
 static void* DeferredInitThread(void*)
 {
-    // Poll for steamclient.so — under LD_PRELOAD we load before Steam has
+    // Poll for steamclient.so -- under LD_PRELOAD we load before Steam has
     // mapped steamclient, so a fixed delay is insufficient.
     DebugLog("[CR] DeferredInit: waiting for steamclient.so\n");
     for (int i = 0; i < 240; i++) {  // up to 120 seconds

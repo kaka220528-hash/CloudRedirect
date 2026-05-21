@@ -55,7 +55,10 @@ bool ListRemoteBlobNames(uint32_t accountId, uint32_t appId,
                          std::unordered_set<std::string>& outNames);
 
 bool HasLocalBlob(uint32_t accountId, uint32_t appId,
-                  const std::string& filename);
+                   const std::string& filename);
+
+// GC: delete unreferenced blobs. Returns count deleted, or -1 on error.
+int GarbageCollectBlobs(uint32_t accountId, uint32_t appId);
 
 // ============================================================================
 

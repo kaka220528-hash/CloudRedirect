@@ -193,9 +193,7 @@ std::string CmdListRemoteApps(const std::string& provider, const std::string& ac
         return JsonError("Not authenticated");
     }
 
-    // Avoid account-wide recursive listing here. That path is much heavier and
-    // has been the problematic Linux CLI path; list app folders first, then
-    // compute per-app stats with narrower app-level scans.
+    // List app folders first, then per-app stats (avoids heavy recursive listing).
     std::string prefix = accountId + "/";
     auto appIds = prov->ListSubfolders(prefix);
     std::map<std::string, std::pair<int, uint64_t>> appStats; // appId -> (count, totalSize)
@@ -707,6 +705,61 @@ std::string CmdPublishFullManifest(const std::string& provider, const std::strin
     });
 }
 
+std::string CmdGcBlobs(const std::string& provider, const std::string& accountId, const std::string& appId,
+                       const std::string& cloudRootArg) {
+    std::string tokenPath = GetTokenPath(provider);
+    if (tokenPath.empty()) {
+        return JsonError("Cannot determine config directory");
+    }
+
+    uint32_t parsedAccountId = static_cast<uint32_t>(std::strtoul(accountId.c_str(), nullptr, 10));
+    uint32_t parsedAppId = static_cast<uint32_t>(std::strtoul(appId.c_str(), nullptr, 10));
+    if (parsedAccountId == 0 || parsedAppId == 0) {
+        return JsonError("Invalid account_id or app_id");
+    }
+
+    auto prov = CreateCloudProvider(provider);
+    if (!prov) {
+        return JsonError("Unknown provider: " + provider);
+    }
+
+    if (!prov->Init(tokenPath)) {
+        return JsonError("Failed to initialize provider");
+    }
+
+    if (!prov->IsAuthenticated()) {
+        prov->Shutdown();
+        return JsonError("Not authenticated");
+    }
+
+    std::string cloudRoot = NormalizeCloudRoot(cloudRootArg);
+    if (cloudRoot.empty()) {
+        prov->Shutdown();
+        return JsonError("cloud_root is required");
+    }
+    std::string storageRoot = cloudRoot + "storage/";
+#ifdef _WIN32
+    for (auto& c : storageRoot) { if (c == '/') c = '\\'; }
+#endif
+
+    LocalStorage::Init(storageRoot);
+    LocalMetadataStore::Init(storageRoot);
+    LocalStorage::InitApp(parsedAccountId, parsedAppId);
+    LocalMetadataStore::InitApp(parsedAccountId, parsedAppId);
+    PendingOpsJournal::Init(storageRoot);
+    CloudStorage::Init(cloudRoot, std::move(prov));
+
+    int result = CloudStorage::GarbageCollectBlobs(parsedAccountId, parsedAppId);
+
+    CloudStorage::Shutdown();
+
+    return JsonObject({
+        {"success", JsonBool(result >= 0)},
+        {"blobs_deleted", JsonInt(static_cast<int64_t>(result >= 0 ? result : 0))},
+        {"error", result < 0 ? JsonString("GC failed: listing incomplete or provider unavailable") : JsonString("")}
+    });
+}
+
 // ── CLI entry point ─────────────────────────────────────────────────────
 
 bool IsCliMode(int argc, char** argv) {
@@ -727,6 +780,7 @@ static void PrintUsage() {
     fprintf(stderr, "  sync-all-remote-apps <provider> <account_id> <cloud_root>  Run SyncAllFromCloud for one account\n");
     fprintf(stderr, "  prune-local-legacy-metadata <cloud_root>  Remove local legacy metadata siblings where safe\n");
     fprintf(stderr, "  publish-full-manifest <provider> <account_id> <app_id> <cloud_root>  Publish local inventory manifest and CN\n");
+    fprintf(stderr, "  gc-blobs <provider> <account_id> <app_id> <cloud_root>  Delete unreferenced SHA blobs from cloud\n");
     fprintf(stderr, "\nProviders: gdrive, onedrive\n");
 }
 
@@ -820,6 +874,13 @@ int RunCli(int argc, char** argv) {
             return 1;
         }
         result = CmdPublishFullManifest(argv[3], argv[4], argv[5], argv[6]);
+    }
+    else if (strcmp(command, "gc-blobs") == 0) {
+        if (argc < 7) {
+            fprintf(stderr, "Error: gc-blobs requires <provider> <account_id> <app_id> <cloud_root>\n");
+            return 1;
+        }
+        result = CmdGcBlobs(argv[3], argv[4], argv[5], argv[6]);
     }
     else {
         fprintf(stderr, "Unknown command: %s\n", command);

@@ -41,7 +41,7 @@ static constexpr int                     MAX_DRAIN_REQUEES = 3;
 static constexpr int                     FAIL_THRESHOLD     = 5;
 static constexpr auto                    RECENT_UPLOAD_TTL = std::chrono::seconds(120);
 
-// Error reporter — set once at Init. Tests inject a no-op or spy.
+// Error reporter -- set once at Init. Tests inject a no-op or spy.
 // Never changed after Init; no mutex needed.
 static Reporter g_reporter;
 static std::atomic<int> g_consecutiveFails{0};
@@ -228,11 +228,8 @@ static void RequeueFailedWorkForPrefixLocked(const std::string& prefix) {
         if (!g_activePaths.count(item.cloudPath)) {
             ++item.drainRequeues;
             g_workQueue.push_back(std::move(item));
-            // NOTE: Do NOT update g_uploadIndex for requeued items. The stored
-            // iterator would be invalidated by any subsequent push_back/erase on
-            // g_workQueue (including from concurrent EnqueueWork calls that hold
-            // g_queueMutex). A requeued item simply loses dedup protection against
-            // a newer upload for the same path — acceptable for a retry path.
+            // Don't update g_uploadIndex for requeued items -- iterator
+            // would be invalidated by concurrent push_back/erase.
         } else {
             // Path is actively being processed; preserve the failed item
             // so it can be retried on the next drain cycle.

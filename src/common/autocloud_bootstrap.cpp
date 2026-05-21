@@ -1,8 +1,10 @@
 #include "autocloud_bootstrap.h"
 #include "autocloud_scan.h"
 #include "app_state.h"
+#include "batch_tracker.h"
 #include "cloud_intercept.h"
 #include "cloud_storage.h"
+#include "cloud_work_queue.h"
 #include "file_util.h"
 #include "local_storage.h"
 #include "log.h"
@@ -485,6 +487,26 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
         return;
     }
 
+    // Drain blob uploads before publishing state -- don't advertise un-uploaded blobs.
+    if (!CloudWorkQueue::DrainQueueForApp(accountId, appId)) {
+        LOG("[AutoCloudImport] Blob drain FAILED for app %u; aborting commit", appId);
+        ClearCanonicalTokens(accountId, appId, publishGeneration);
+        finish(false, publishGeneration);
+        return;
+    }
+
+    // Abort if batch in progress -- CompleteBatch owns CN/state publish.
+    if (CloudIntercept::BatchTracker_ActiveId(accountId, appId) != 0) {
+        LOG("[AutoCloudImport] Active batch detected for app %u; deferring import", appId);
+        ClearCanonicalTokens(accountId, appId, publishGeneration);
+        finish(false, publishGeneration);
+        return;
+    }
+
+    // Sync mutex: serialize CN increment + state publish.
+    auto syncMtx = CloudStorage::AcquireAppSyncMutex(accountId, appId);
+    std::lock_guard<std::mutex> syncLock(*syncMtx);
+
     uint64_t oldCN = LocalStorage::GetChangeNumber(accountId, appId);
     cn = LocalStorage::IncrementChangeNumber(accountId, appId);
     if (cn <= oldCN) {
@@ -700,8 +722,6 @@ int RestoreBlobsToGameFolder(uint32_t accountId, uint32_t appId,
             if (!ec) {
                 auto diskSeconds = AutoCloudUtil::FileTimeToUnixSeconds(diskTime);
                 // Skip restore only if disk file is newer AND non-empty.
-                // A zero-byte file (e.g., from a game crash mid-write) should
-                // not block restoration of a valid blob.
                 std::error_code sizeEc;
                 auto diskSize = std::filesystem::file_size(targetFsPath, sizeEc);
                 if (diskSeconds > fe.timestamp && !sizeEc && diskSize > 0) {
