@@ -4,4 +4,4 @@ ui/bin/
 ui/obj/
 ui-linux/build/
 flatpak/.flatpak-builder/
-flatpak/build-dir/
+flatpak/build-dir/ui/Resources/payloads/

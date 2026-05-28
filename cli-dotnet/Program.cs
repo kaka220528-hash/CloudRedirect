@@ -123,79 +123,8 @@ class Program
             Console.WriteLine("Steam closed.");
         }
 
-        // Check if payload cache exists; if not, bootstrap Steam to download it
+        // ApplyOfflineSetup will deploy embedded payload if cache is missing
         var patcher = new Patcher(steamPath, msg => Console.WriteLine(msg));
-        if (!patcher.HasPayloadCache())
-        {
-            Console.WriteLine();
-            Console.WriteLine("Payload cache not found. Starting Steam to download it...");
-            var steamExe2 = Path.Combine(steamPath, "steam.exe");
-            if (File.Exists(steamExe2))
-            {
-                try
-                {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = steamExe2,
-                        UseShellExecute = true
-                    })?.Dispose();
-                }
-                catch { }
-            }
-
-            Console.WriteLine("Waiting for payload to appear (up to 90 seconds)...");
-            bool found = false;
-            for (int i = 0; i < 180; i++)
-            {
-                System.Threading.Thread.Sleep(500);
-                if (patcher.HasPayloadCache()) { found = true; break; }
-            }
-
-            if (!found)
-            {
-                Console.Error.WriteLine("FAILED: Payload cache did not appear.");
-                Console.Error.WriteLine("Try running Steam manually, wait for it to fully load, then close and retry.");
-                return 1;
-            }
-            Console.WriteLine("Payload cache found.");
-
-            // Close Steam again before patching
-            if (SteamDetector.IsSteamRunning())
-            {
-                Console.WriteLine("Closing Steam...");
-                var shutdownExe = Path.Combine(steamPath, "steam.exe");
-                if (File.Exists(shutdownExe))
-                {
-                    try
-                    {
-                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                        {
-                            FileName = shutdownExe,
-                            Arguments = "-shutdown",
-                            UseShellExecute = true
-                        })?.Dispose();
-                    }
-                    catch { }
-                }
-
-                for (int i = 0; i < 30; i++)
-                {
-                    System.Threading.Thread.Sleep(500);
-                    if (!SteamDetector.IsSteamRunning()) break;
-                }
-
-                if (SteamDetector.IsSteamRunning())
-                {
-                    foreach (var p in System.Diagnostics.Process.GetProcessesByName("steam"))
-                    {
-                        try { p.Kill(); } catch { }
-                        finally { p.Dispose(); }
-                    }
-                    System.Threading.Thread.Sleep(1000);
-                }
-                Console.WriteLine("Steam closed.");
-            }
-        }
 
         // Apply STFixer patches
         Console.WriteLine();
