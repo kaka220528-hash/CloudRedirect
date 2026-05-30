@@ -307,8 +307,8 @@ bool PatchPlaytimeEnforcement() {
 // ─── Settings hook install ────────────────────────────────────────────
 
 bool InstallParentalSettingsHook(bool fullBypass) {
-    g_fullBypass = fullBypass;
 #ifdef _WIN32
+    g_fullBypass = fullBypass;
     uint8_t* base; MODULEINFO mi;
     if (!GetSteamClient(base, mi)) return false;
 

@@ -33,6 +33,13 @@ static std::atomic<NotificationDirect_t> g_origNotificationDirect{nullptr};
 static std::atomic<SyncSend2_t>          g_origSyncSend2{nullptr};
 
 static std::atomic<bool> g_initialized{false};
+static std::atomic<bool> g_shuttingDown{false};
+static std::atomic<int>  g_hookRefCount{0};
+
+struct HookGuard {
+    HookGuard() { g_hookRefCount.fetch_add(1, std::memory_order_acquire); }
+    ~HookGuard() { g_hookRefCount.fetch_sub(1, std::memory_order_release); }
+};
 
 extern "C" void CR_SetCrashContext(const char* hook, const char* method, uint32_t appId);
 extern "C" void CR_ClearCrashContext();
@@ -319,6 +326,11 @@ static bool IsCloudRpc(const char* methodName) {
 
 extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* request, void* response, int* flags)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origBYieldingSend.load(std::memory_order_acquire);
+        return fn ? fn(pThis, methodName, request, response, flags) : 0;
+    }
     CrashContextScope crashContext("BYieldingSend:entry", methodName, 0);
     auto origFn = g_origBYieldingSend.load(std::memory_order_acquire);
     
@@ -434,6 +446,11 @@ static uint32_t CheckNotificationNamespaceApp(const char* methodName, void* body
 
 extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void* body, int* flags)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origNotificationDirect.load(std::memory_order_acquire);
+        return fn ? fn(pThis, methodName, body, flags) : 0;
+    }
     CrashContextScope crashContext("NotificationDirect:entry", methodName, 0);
     auto origFn = g_origNotificationDirect.load(std::memory_order_acquire);
     for (int i = 0; !origFn && i < 1000; ++i) {
@@ -498,6 +515,11 @@ extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void
 
 extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, unsigned int bufLen, void* response, int* flags)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origSyncSend2.load(std::memory_order_acquire);
+        return fn ? fn(pThis, methodName, buf, bufLen, response, flags) : 0;
+    }
     CrashContextScope crashContext("SyncSend2:entry", methodName, 0);
     auto origFn = g_origSyncSend2.load(std::memory_order_acquire);
     for (int i = 0; !origFn && i < 1000; ++i) {
@@ -576,6 +598,11 @@ void CloudHooks::SetOriginalIsCloudEnabled(void* orig) {
 
 extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origIsCloudEnabledForApp.load(std::memory_order_acquire);
+        return fn ? fn(pThis, appId) : true;
+    }
     CrashContextScope crashContext("IsCloudEnabledForApp:entry", "IsCloudEnabledForApp", appId);
     if (CloudIntercept::IsNamespaceApp(appId)) {
         LOG("[Hook] IsCloudEnabledForApp(%u) -> true (namespace app)", appId);
@@ -587,4 +614,10 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
         return origFn(pThis, appId);
     }
     return true;
+}
+
+void CloudHooks::BeginShutdown() {
+    g_shuttingDown.store(true, std::memory_order_release);
+    for (int i = 0; i < 300 && g_hookRefCount.load(std::memory_order_acquire) > 0; ++i)
+        usleep(10000); // 10ms, up to 3s total
 }

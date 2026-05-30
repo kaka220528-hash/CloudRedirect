@@ -14,4 +14,7 @@ namespace CloudHooks
     // Resolve protobuf helper functions from the loaded steamclient.so.
     // Must be called after steamclient is loaded. Returns true on success.
     bool ResolveProtobufHelpers(void* steamclientBase, size_t steamclientSize);
+
+    // Signal hooks to stop and wait for in-flight calls to drain.
+    void BeginShutdown();
 }

@@ -126,26 +126,6 @@ static uint32_t ClampFileSizeToUint32(uint64_t rawSize, const char* fieldName,
     return static_cast<uint32_t>(rawSize);
 }
 
-// Per-app diagnostic gate. Hardcoded to ULTRAKILL (1229490) for debugging.
-static bool DiagEnabledForApp(uint32_t appId) {
-    (void)appId;
-    return true;
-}
-
-static void DiagHexDump(const char* tag, uint32_t appId,
-                        const uint8_t* data, size_t len) {
-    if (!DiagEnabledForApp(appId)) return;
-    LOG("[DIAG] %s app=%u bytes=%zu", tag, appId, len);
-    char hexLine[200];
-    for (size_t off = 0; off < len; off += 32) {
-        int pos = 0;
-        size_t end = (off + 32 < len) ? off + 32 : len;
-        for (size_t i = off; i < end; i++) {
-            pos += snprintf(hexLine + pos, sizeof(hexLine) - pos, "%02X ", data[i]);
-        }
-        LOG("[DIAG] %s app=%u +%04X: %s", tag, appId, (unsigned)off, hexLine);
-    }
-}
 
 static void InvalidateTokenCaches(uint32_t accountId, uint32_t appId);
 
@@ -1149,18 +1129,6 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     auto* cnField = PB::FindField(reqBody, 2);
     uint64_t clientChangeNumber = cnField ? cnField->varintVal : 0;
 
-    if (DiagEnabledForApp(appId)) {
-        // Decode req fields (1=appid, 2=synced_change_number) and dump anything else.
-        LOG("[DIAG] GetAppFileChangelist req app=%u synced_change_number=%llu fields=%zu",
-            appId, (unsigned long long)clientChangeNumber, reqBody.size());
-        for (const auto& f : reqBody) {
-            if (f.fieldNum != 1 && f.fieldNum != 2) {
-                LOG("[DIAG] GetAppFileChangelist req app=%u unknown field tag=%u wire=%d",
-                    appId, f.fieldNum, (int)f.wireType);
-            }
-        }
-    }
-
     uint32_t accountId = 0;
     SetRpcCrashContext("GetChangelist:account", "Cloud.GetAppFileChangelist#1", appId);
     if (!RequireAccountId("GetAppFileChangelist", appId, accountId)) {
@@ -1294,7 +1262,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         }
 
         LOG("[NS-CL] GetAppFileChangelist app=%u: local fallback CN=%llu (%zu files)",
-            appId, localCN, cloudManifest.size());
+            appId, cloudCN, cloudManifest.size());
     }
 
     // Async AutoCloud bootstrap; set is_only_delta=1 if active.
@@ -1329,10 +1297,10 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 uint32_t asyncAcct = accountId;
                 uint32_t asyncApp = appId;
                 std::thread([statePtr, asyncAcct, asyncApp] {
-                    // Acquire sync mutex to avoid racing with CompleteBatch.
+                    CloudStorage::InflightSyncScope guard;
+                    if (!guard.entered) return;
                     auto syncMtx = CloudStorage::AcquireAppSyncMutex(asyncAcct, asyncApp);
                     std::lock_guard<std::mutex> lock(*syncMtx);
-                    // Abort if a CompleteBatch already published a newer CN.
                     auto existing = CloudStorage::FetchCloudState(asyncAcct, asyncApp);
                     if (existing.status == CloudStorage::StateFetchStatus::Ok &&
                         existing.state.cn >= statePtr->cn) {
@@ -1673,22 +1641,6 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
 
     if (!prepared.empty())
         SetCloudSyncState(appId, "synchronized");
-
-    if (DiagEnabledForApp(appId)) {
-        LOG("[DIAG] GetAppFileChangelist resp app=%u CN=%llu is_only_delta=%d files=%zu prefixes=%zu",
-            appId, (unsigned long long)serverChangeNumber, responseIsDelta ? 1 : 0,
-            prepared.size(), prefixList.size());
-        for (size_t i = 0; i < prefixList.size(); ++i) {
-            LOG("[DIAG] GetAppFileChangelist resp app=%u prefix[%zu]='%s'",
-                appId, i, prefixList[i].c_str());
-        }
-        for (const auto& pf : prepared) {
-            LOG("[DIAG] GetAppFileChangelist resp app=%u file leaf='%s' prefix_idx=%u",
-                appId, pf.leaf.c_str(), pf.prefixIdx);
-        }
-        const auto& ourData = body.Data();
-        DiagHexDump("GetAppFileChangelist resp", appId, ourData.data(), ourData.size());
-    }
 
 #ifdef DEBUG_HEX_DUMP
     {
@@ -2083,6 +2035,8 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
         uint32_t asyncAcct = accountId;
         uint32_t asyncApp = appId;
         std::thread([asyncAcct, asyncApp] {
+            CloudStorage::InflightSyncScope guard;
+            if (!guard.entered) return;
             RestoreAppMetadata(asyncAcct, asyncApp);
         }).detach();
     }
@@ -2304,20 +2258,11 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
     PrepareBatchCanonicalTokens(accountId, appId);
     PendingOpsJournal::RecordUploadBatchStart(accountId, appId);
 
-    if (DiagEnabledForApp(appId)) {
-        LOG("[DIAG] BeginAppUploadBatch req app=%u currentCN=%llu fields=%zu",
-            appId, (unsigned long long)currentCN, reqBody.size());
-    }
-
     int uploadCount = 0, deleteCount = 0;
     for (auto& f : reqBody) {
         if (f.fieldNum == 3 && f.wireType == PB::LengthDelimited) {
             std::string name(reinterpret_cast<const char*>(f.data), f.dataLen);
             LOG("[NS-BATCH]   upload: %s", SanitizeForLog(name).c_str());
-            if (DiagEnabledForApp(appId)) {
-                LOG("[DIAG] BeginAppUploadBatch req app=%u upload_raw='%s' (len=%u)",
-                    appId, SanitizeForLog(name).c_str(), f.dataLen);
-            }
             TryCaptureRootToken(accountId, appId,
                 CanonicalizeUploadRootToken(accountId, appId, StripRootToken(name), ExtractRootToken(name)));
             ++uploadCount;
@@ -2325,10 +2270,6 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
         if (f.fieldNum == 4 && f.wireType == PB::LengthDelimited) {
             std::string name(reinterpret_cast<const char*>(f.data), f.dataLen);
             LOG("[NS-BATCH]   delete: %s", SanitizeForLog(name).c_str());
-            if (DiagEnabledForApp(appId)) {
-                LOG("[DIAG] BeginAppUploadBatch req app=%u delete_raw='%s' (len=%u)",
-                    appId, SanitizeForLog(name).c_str(), f.dataLen);
-            }
             TryCaptureRootToken(accountId, appId,
                 CanonicalizeUploadRootToken(accountId, appId, StripRootToken(name), ExtractRootToken(name)));
             ++deleteCount;
@@ -2664,6 +2605,8 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             uint64_t retryCN = state.cn;
             uint64_t retryBuildId = state.appBuildId;
             std::thread([filesToMerge, retryCN, retryBuildId, accountId, appId] {
+                CloudStorage::InflightSyncScope guard;
+                if (!guard.entered) return;
                 constexpr int kMaxRetries = 3;
                 constexpr int kBaseDelayMs = 2000;
                 for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
@@ -2712,6 +2655,8 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
 
     // Fire-and-forget GC after successful commit.
     std::thread([accountId, appId]() {
+        CloudStorage::InflightSyncScope guard;
+        if (!guard.entered) return;
         CloudStorage::GarbageCollectBlobs(accountId, appId);
     }).detach();
 

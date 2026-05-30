@@ -699,17 +699,25 @@ bool Init() {
             usedSigs = true;
             LOG("[KvInjector] Init: all signatures resolved successfully");
         } else {
-            LOG("[KvInjector] SigScan: FAILED (readCfg=%d getSect=%d kvFind=%d "
-                "kvSetU64=%d kvSetI32=%d kvSetStr=%d global=%d) -- using fallback RVAs",
+            LOG("[KvInjector] SigScan: partial (readCfg=%d getSect=%d kvFind=%d "
+                "kvSetU64=%d kvSetI32=%d kvSetStr=%d global=%d)",
                 readCfg ? 1 : 0, getSect ? 1 : 0, kvFind ? 1 : 0,
                 kvSetU64 ? 1 : 0, kvSetI32 ? 1 : 0, kvSetStr ? 1 : 0, globalEng ? 1 : 0);
-            g_r.globalEnginePtr = reinterpret_cast<void**>(base + FALLBACK_RVA_GLOBAL_ENGINE);
-            g_r.readConfigU64   = reinterpret_cast<ReadConfigU64Fn>(base + FALLBACK_RVA_READ_CONFIG_U64);
-            g_r.getSection      = reinterpret_cast<GetSectionFn>(base + FALLBACK_RVA_GET_SECTION);
-            g_r.kvFindKey       = reinterpret_cast<KvFindKeyFn>(base + FALLBACK_RVA_KV_FIND_KEY);
-            g_r.kvSetUint64     = reinterpret_cast<KvSetUint64Fn>(base + FALLBACK_RVA_KV_SET_UINT64);
-            g_r.kvSetInt32      = reinterpret_cast<KvSetInt32Fn>(base + FALLBACK_RVA_KV_SET_INT32);
-            g_r.kvSetString     = reinterpret_cast<KvSetStringFn>(base + FALLBACK_RVA_KV_SET_STRING);
+
+            g_r.globalEnginePtr = reinterpret_cast<void**>(globalEng ? globalEng : (base + FALLBACK_RVA_GLOBAL_ENGINE));
+            g_r.readConfigU64   = reinterpret_cast<ReadConfigU64Fn>(readCfg ? readCfg : (base + FALLBACK_RVA_READ_CONFIG_U64));
+            g_r.getSection      = reinterpret_cast<GetSectionFn>(getSect ? getSect : (base + FALLBACK_RVA_GET_SECTION));
+            g_r.kvFindKey       = reinterpret_cast<KvFindKeyFn>(kvFind ? kvFind : (base + FALLBACK_RVA_KV_FIND_KEY));
+            g_r.kvSetUint64     = reinterpret_cast<KvSetUint64Fn>(kvSetU64 ? kvSetU64 : (base + FALLBACK_RVA_KV_SET_UINT64));
+            g_r.kvSetInt32      = reinterpret_cast<KvSetInt32Fn>(kvSetI32 ? kvSetI32 : (base + FALLBACK_RVA_KV_SET_INT32));
+            g_r.kvSetString     = reinterpret_cast<KvSetStringFn>(kvSetStr ? kvSetStr : (base + FALLBACK_RVA_KV_SET_STRING));
+
+            // If critical functions couldn't be sig-scanned, don't trust fallback RVAs
+            if (!globalEng || !getSect || !kvFind) {
+                LOG("[KvInjector] Critical functions unresolved -- KV injector DISABLED (prevents crash on stale RVAs)");
+                return;
+            }
+            usedSigs = true;
         }
 
         LOG("[KvInjector] Init: resolved Linux pointers (engine global @ %p, sigs=%d)",

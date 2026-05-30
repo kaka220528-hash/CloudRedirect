@@ -461,6 +461,7 @@ static void OnUnload()
 
     if (g_initialized.load(std::memory_order_acquire))
     {
+        CloudHooks::BeginShutdown();
         VtableHook::RemoveHooks(g_vtableInfo);
         VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo);
         Log::Info("cloud_redirect.so unloaded");
