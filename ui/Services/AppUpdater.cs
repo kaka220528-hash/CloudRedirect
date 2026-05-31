@@ -53,6 +53,8 @@ internal static class AppUpdater
         public string? AssetName { get; init; }
         /// <summary>Release body (markdown changelog) from GitHub.</summary>
         public string? Body { get; init; }
+        /// <summary>URL to the GitHub release page.</summary>
+        public string? HtmlUrl { get; init; }
     }
 
     /// <summary>
@@ -150,6 +152,9 @@ internal static class AppUpdater
             var body = root.TryGetProperty("body", out var bodyProp)
                 ? bodyProp.GetString() ?? ""
                 : "";
+            var htmlUrl = root.TryGetProperty("html_url", out var htmlProp)
+                ? htmlProp.GetString()
+                : null;
 
             return new CheckResult
             {
@@ -157,7 +162,8 @@ internal static class AppUpdater
                 TagName = tagName,
                 DownloadUrl = downloadUrl,
                 AssetName = assetName,
-                Body = body
+                Body = body,
+                HtmlUrl = htmlUrl
             };
         }
         catch

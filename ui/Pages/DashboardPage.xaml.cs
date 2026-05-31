@@ -12,6 +12,11 @@ public partial class DashboardPage : Page
 {
     private string? _steamPath;
 
+    public void HideDllUpdateBanner()
+    {
+        Dispatcher.Invoke(() => UpdateBanner.Visibility = Visibility.Collapsed);
+    }
+
     public DashboardPage()
     {
         InitializeComponent();
@@ -19,6 +24,12 @@ public partial class DashboardPage : Page
         {
             try { await LoadStatusAsync(); }
             catch { }
+
+            // Give the app-level update check time to finish, then hide the
+            // DLL banner if a full app update is available (avoids two banners).
+            await Task.Delay(3000);
+            if (Window.GetWindow(this) is MainWindow mw && mw.AppUpdateAvailable)
+                UpdateBanner.Visibility = Visibility.Collapsed;
         };
     }
 

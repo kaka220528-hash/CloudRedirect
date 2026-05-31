@@ -1295,7 +1295,7 @@ Files can be restored from the Restore tab. Continue?</value>
     <value>Reset Local CloudRedirect Cache</value>
   </data>
   <data name="Settings_ResetCacheDescription" xml:space="preserve">
-    <value>Deletes CloudRedirect local cache. This only removes the cache and forces the cloud provider to resync. This can cause data loss in some edge cases!</value>
+    <value>Deletes CloudRedirect local cache. This only removes the cache and forces the cloud provider to resync.</value>
   </data>
   <data name="Settings_Reset" xml:space="preserve">
     <value>Reset</value>
@@ -1349,8 +1349,6 @@ Files can be restored from the Restore tab. Continue?</value>
   </data>
   <data name="Settings_ConfirmResetMessage" xml:space="preserve">
     <value>This will delete the CloudRedirect local cache and force the cloud provider to resync.
-
-This can cause data loss in some edge cases.
 
 Are you sure?</value>
   </data>
