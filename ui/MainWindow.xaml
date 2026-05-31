@@ -31,6 +31,12 @@
             <StackPanel>
                 <DockPanel>
                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
+                        <ui:Button x:Name="UpdateReleaseNotesButton"
+                                   Content="Release Notes"
+                                   Appearance="Secondary"
+                                   Visibility="Collapsed"
+                                   Margin="0,0,8,0"
+                                   Click="UpdateReleaseNotes_Click" />
                         <ui:Button x:Name="UpdateSkipButton"
                                    Content="{res:Loc AppUpdate_Skip}"
                                    Appearance="Secondary"
@@ -110,7 +116,6 @@
                 <ui:NavigationViewItem x:Name="RestartSteamItem"
                                        Content="{res:Loc Nav_RestartSteam}"
                                        Icon="{ui:SymbolIcon ArrowSync24}"
-                                       Visibility="Collapsed"
                                        Click="RestartSteamItem_Click" />
                 <ui:NavigationViewItem Content="{res:Loc Nav_Settings}"
                                        Icon="{ui:SymbolIcon Settings24}"

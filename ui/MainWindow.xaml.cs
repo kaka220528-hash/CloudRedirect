@@ -13,6 +13,7 @@ namespace CloudRedirect;
 public partial class MainWindow : FluentWindow
 {
     private Services.AppUpdater.CheckResult? _pendingUpdate;
+    public bool AppUpdateAvailable { get; private set; }
 
     public MainWindow()
     {
@@ -99,6 +100,10 @@ public partial class MainWindow : FluentWindow
                 UpdateChangelogScroll.Visibility = Visibility.Visible;
             }
 
+            if (!string.IsNullOrEmpty(result.HtmlUrl))
+                UpdateReleaseNotesButton.Visibility = Visibility.Visible;
+
+            AppUpdateAvailable = true;
             UpdateBanner.Visibility = Visibility.Visible;
         }
         catch
@@ -116,6 +121,7 @@ public partial class MainWindow : FluentWindow
         // Switch banner to download mode
         UpdateNowButton.Visibility = Visibility.Collapsed;
         UpdateSkipButton.Visibility = Visibility.Collapsed;
+        UpdateReleaseNotesButton.Visibility = Visibility.Collapsed;
         UpdateChangelogScroll.Visibility = Visibility.Collapsed;
         UpdateBannerStatus.Text = $"Downloading v{versionStr}...";
         UpdateProgressBar.Visibility = Visibility.Visible;
@@ -153,6 +159,18 @@ public partial class MainWindow : FluentWindow
         // If successful, the process will have exited already
     }
 
+    private void UpdateReleaseNotes_Click(object sender, RoutedEventArgs e)
+    {
+        if (_pendingUpdate?.HtmlUrl != null)
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = _pendingUpdate.HtmlUrl,
+                UseShellExecute = true
+            });
+        }
+    }
+
     private void UpdateSkip_Click(object sender, RoutedEventArgs e)
     {
         UpdateBanner.Visibility = Visibility.Collapsed;
@@ -161,7 +179,7 @@ public partial class MainWindow : FluentWindow
 
     public void ShowRestartSteam()
     {
-        Dispatcher.Invoke(() => RestartSteamItem.Visibility = Visibility.Visible);
+        // Button is always visible now; kept for callers.
     }
 
     private async void RestartSteamItem_Click(object sender, RoutedEventArgs e)

@@ -733,7 +733,7 @@ int RestoreBlobsToGameFolder(uint32_t accountId, uint32_t appId,
                 auto diskSeconds = AutoCloudUtil::FileTimeToUnixSeconds(diskTime);
                 std::error_code sizeEc;
                 auto diskSize = std::filesystem::file_size(targetFsPath, sizeEc);
-                if (diskSeconds > fe.timestamp && !sizeEc && diskSize > 0) {
+                if (diskSeconds >= fe.timestamp && !sizeEc && diskSize > 0) {
                     continue;
                 }
             }
