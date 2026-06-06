@@ -382,6 +382,69 @@ static bool HasNamespaceApps() {
     return !g_namespaceApps.empty();
 }
 
+uint32_t GetAccountId();  // defined later
+
+// "Mark as private" support: Steam stores per-user private appIds as a JSON array
+// under PrivateApps_<accountId> in localconfig.vdf. We honor it so the friends
+// "now playing" spoof does not reveal games the user has hidden. Cached briefly
+// so we don't re-read the file on every GamesPlayed broadcast.
+static std::mutex g_privateAppsMutex;
+static std::unordered_set<uint32_t> g_privateApps;
+static std::chrono::steady_clock::time_point g_privateAppsLoaded{};
+
+static void RefreshPrivateAppsLocked() {
+    g_privateApps.clear();
+    uint32_t accountId = GetAccountId();
+    if (!accountId || g_steamPath.empty()) return;
+
+    std::string vdfPath = g_steamPath + "userdata\\" + std::to_string(accountId)
+        + "\\config\\localconfig.vdf";
+    auto vdfPathWide = FileUtil::Utf8ToPath(vdfPath).wstring();
+    HANDLE hFile = CreateFileW(vdfPathWide.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    std::string content;
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
+        content.resize(fileSize);
+        DWORD bytesRead = 0;
+        ReadFile(hFile, (LPVOID)content.data(), fileSize, &bytesRead, nullptr);
+        content.resize(bytesRead);
+    }
+    CloseHandle(hFile);
+
+    // Find:  "PrivateApps_<accountId>"   "[480,2499870,...]"
+    std::string key = "\"PrivateApps_" + std::to_string(accountId) + "\"";
+    size_t k = content.find(key);
+    if (k == std::string::npos) return;
+    size_t lb = content.find('[', k);
+    size_t rb = (lb == std::string::npos) ? std::string::npos : content.find(']', lb);
+    if (lb == std::string::npos || rb == std::string::npos) return;
+
+    // Parse comma-separated appIds inside the brackets.
+    size_t i = lb + 1;
+    while (i < rb) {
+        while (i < rb && !isdigit((unsigned char)content[i])) ++i;
+        if (i >= rb) break;
+        uint32_t id = (uint32_t)strtoul(content.c_str() + i, nullptr, 10);
+        if (id) g_privateApps.insert(id);
+        while (i < rb && isdigit((unsigned char)content[i])) ++i;
+    }
+}
+
+bool IsPrivateApp(uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_privateAppsMutex);
+    auto now = std::chrono::steady_clock::now();
+    if (g_privateAppsLoaded.time_since_epoch().count() == 0 ||
+        now - g_privateAppsLoaded > std::chrono::seconds(5)) {
+        RefreshPrivateAppsLocked();
+        g_privateAppsLoaded = now;
+    }
+    return g_privateApps.count(appId) > 0;
+}
+
 void AddNamespaceApp(uint32_t appId) {
     std::lock_guard<std::mutex> lock(g_namespaceAppsMutex);
     g_namespaceApps.insert(appId);
@@ -4503,6 +4566,7 @@ static std::vector<uint8_t> RewriteGamesPlayed(const uint8_t* body, uint32_t bod
         uint32_t appId = (uint32_t)(gameIdField->varintVal & 0x00FFFFFF); // low 24 bits = appId in CGameID
         if (appId == 0) continue;
         if (!IsNamespaceApp(appId)) continue;
+        if (IsPrivateApp(appId)) continue;  // respect "mark as private"
         // Check if game_extra_info is already set
         auto existing = PB::GetString(inner, GP_FIELD_GAME_EXTRA_INFO);
         if (!existing.empty()) continue;
@@ -4534,10 +4598,16 @@ static std::vector<uint8_t> RewriteGamesPlayed(const uint8_t* body, uint32_t bod
         bool isNs = appId > 0 && IsNamespaceApp(appId);
         auto existingInfo = PB::GetString(inner, GP_FIELD_GAME_EXTRA_INFO);
 
-        if (isNs && existingInfo.empty()) {
+        if (isNs && existingInfo.empty() && !IsPrivateApp(appId)) {
             // Rebuild this GamePlayed entry as a non-Steam game shortcut.
             // The friends server shows "Playing non-Steam game: <title>"
             // when game_id has CGameID type 2 (shortcut).
+            //
+            // NOTE: a non-Steam shortcut has no per-app privacy on the friends
+            // server, so we must enforce the user's "mark as private" choice
+            // ourselves via IsPrivateApp() (reads PrivateApps_<accountId> from
+            // localconfig.vdf). If the app is private we fall through and copy
+            // the entry unmodified, leaving the game hidden as the user intends.
             const std::string& name = LookupGameName(appId);
 
             // Build a shortcut-style CGameID: type=2, appId=0, modId=hash
@@ -4568,6 +4638,8 @@ static std::vector<uint8_t> RewriteGamesPlayed(const uint8_t* body, uint32_t bod
             newBody.WriteSubmessage(GP_FIELD_GAMES_PLAYED, sub);
             LOG("[GamesPlayed] Injected game_extra_info for app %u: \"%s\"", appId, name.c_str());
         } else {
+            if (isNs && existingInfo.empty() && IsPrivateApp(appId))
+                LOG("[GamesPlayed] App %u is marked private -- not injecting (respecting privacy)", appId);
             // Copy unmodified
             newBody.WriteBytes(f.fieldNum, f.data, f.dataLen);
         }
