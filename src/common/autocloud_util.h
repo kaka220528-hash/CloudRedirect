@@ -34,7 +34,7 @@ static constexpr uintmax_t kMaxAppInfoBytes = 512ULL * 1024 * 1024;
 static constexpr uint32_t kMaxAppInfoStrings = 200000;
 static constexpr size_t kMaxAutoCloudScanFiles = 20000;
 static constexpr int kMaxAutoCloudScanMillis = 5000;
-static constexpr uint64_t kMaxAutoCloudCandidateBytes = 128ULL * 1024 * 1024;
+// No per-file size cap; imports are bounded by the app's UFS quota.
 
 // Wildcard matching caps against exponential backtracking.
 static constexpr size_t kMaxWildcardPatternLen = 1024;

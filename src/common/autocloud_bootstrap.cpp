@@ -44,7 +44,6 @@ static int g_orchestratorCount = 0;
 static constexpr int kMaxConcurrentBootstraps = 8;
 static std::atomic<int> g_activeWorkerCount{0};
 
-static constexpr uint64_t kMaxImportBytes = 128ULL * 1024 * 1024;
 
 // Helpers
 
@@ -88,11 +87,6 @@ static std::vector<uint8_t> ReadWholeFile(const std::string& path, bool& ok) {
     if (!f) return {};
     auto size = f.tellg();
     if (size < 0) return {};
-    if (static_cast<uint64_t>(size) > kMaxImportBytes) {
-        LOG("[AutoCloudImport] Skipping oversized source: %s (%llu bytes)",
-            path.c_str(), static_cast<unsigned long long>(size));
-        return {};
-    }
     if (!f.seekg(0, std::ios::beg)) return {};
     std::vector<uint8_t> data(static_cast<size_t>(size));
     if (!data.empty() && !f.read(reinterpret_cast<char*>(data.data()), size)) return {};

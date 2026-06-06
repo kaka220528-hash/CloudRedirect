@@ -46,7 +46,6 @@ using AutoCloudUtil::IsSafeRelativePath;
 using AutoCloudUtil::IsLinuxOS;
 using AutoCloudUtil::kMaxAppInfoBytes;
 using AutoCloudUtil::kMaxAppInfoStrings;
-using AutoCloudUtil::kMaxAutoCloudCandidateBytes;
 using AutoCloudUtil::kMaxAutoCloudScanFiles;
 using AutoCloudUtil::kMaxAutoCloudScanMillis;
 using AutoCloudUtil::NormalizeSlashes;
@@ -577,7 +576,7 @@ static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& st
 
 // SHA1 for files
 
-// Whole-file SHA1; bounded by kMaxAutoCloudCandidateBytes.
+// Whole-file SHA1; rejects negative size from a stat race.
 static std::vector<uint8_t> SHA1File(const std::string& path) {
     std::ifstream f(FileUtil::Utf8ToPath(path), std::ios::binary);
     if (!f) return {};
@@ -585,7 +584,7 @@ static std::vector<uint8_t> SHA1File(const std::string& path) {
     // Read entire file and hash it
     f.seekg(0, std::ios::end);
     auto size = f.tellg();
-    if (size < 0 || static_cast<uint64_t>(size) > kMaxAutoCloudCandidateBytes) {
+    if (size < 0) {
         return {};
     }
     f.seekg(0);
@@ -643,11 +642,6 @@ ScanResult GetFileList(const std::string& steamPath,
         std::error_code ec;
         uint64_t rawSize = (uint64_t)fileEntry.file_size(ec);
         if (ec) return;
-        if (rawSize > kMaxAutoCloudCandidateBytes) {
-            LOG("GetAutoCloudFileList: skipping oversized app %u candidate %s (%llu bytes)",
-                appId, sourcePath.c_str(), (unsigned long long)rawSize);
-            return;
-        }
 
         auto sha = SHA1File(FileUtil::PathToUtf8(fileEntry.path()));
         if (sha.empty()) {
