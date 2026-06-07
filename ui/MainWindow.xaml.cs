@@ -50,6 +50,7 @@ public partial class MainWindow : FluentWindow
         NavCloudProvider.Visibility = vis;
         NavApps.Visibility = vis;
         NavCleanup.Visibility = vis;
+        NavCloud760.Visibility = vis;
 
         // Hide the mode chooser once fully committed to cloud_redirect
         NavChoiceMode.Visibility = cloudOnly ? Visibility.Collapsed : Visibility.Visible;

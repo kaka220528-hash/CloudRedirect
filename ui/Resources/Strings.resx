@@ -1050,6 +1050,12 @@ Skipped {0} file(s) (already exist at original location).</value>
   <data name="Cleanup_Description" xml:space="preserve">
     <value>SteamTools redirected all lua apps' cloud saves through app 760, polluting every game's remote/ folder with every other game's files. Scan to see which apps are affected, then select files to remove.</value>
   </data>
+  <data name="Cleanup_OstBanner_Title" xml:space="preserve">
+    <value>OpenSteamTool detected</value>
+  </data>
+  <data name="Cleanup_OstBanner_Description" xml:space="preserve">
+    <value>OpenSteamTool does not route cloud saves through app 760. This page is for cleaning up files left by a prior SteamTools install.</value>
+  </data>
   <data name="Cleanup_ScanForContamination" xml:space="preserve">
     <value>Scan for Contamination</value>
   </data>
@@ -1617,11 +1623,29 @@ Are you sure?</value>
   <data name="Settings_AutoUpdateDllHint" xml:space="preserve">
     <value>Automatically check for and install newer versions of the CloudRedirect DLL when Steam launches. The update takes effect on the next Steam restart.</value>
   </data>
+  <data name="Settings_Extra" xml:space="preserve">
+    <value>Quality of Life Placeholder</value>
+  </data>
+  <data name="Settings_ExtraHint" xml:space="preserve">
+    <value>Optional extras that aren't part of cloud sync. Changes take effect on next game launch.</value>
+  </data>
   <data name="Settings_ShowNonSteamGame" xml:space="preserve">
-    <value>Show Game in Friends</value>
+    <value>Show Lua Game in Status</value>
   </data>
   <data name="Settings_ShowNonSteamGameHint" xml:space="preserve">
-    <value>When playing a game unlocked by a Lua, show it as "Playing non-Steam game" in your friends list instead of appearing offline. Takes effect on next game launch.</value>
+    <value>When playing a game unlocked by a Lua, show it as your Steam status instead of appearing online but not actively in a game.</value>
+  </data>
+  <data name="Settings_Experimental" xml:space="preserve">
+    <value>Experimental Features</value>
+  </data>
+  <data name="Settings_ExperimentalHint" xml:space="preserve">
+    <value>PLACEHOLDER LOREM IPSUM</value>
+  </data>
+  <data name="Settings_GetAchievementData" xml:space="preserve">
+    <value>Make Achievements Work</value>
+  </data>
+  <data name="Settings_GetAchievementDataHint" xml:space="preserve">
+    <value>Grab achievement data from Steam, makes achievements appear for games that ST itself does not get achievement data for.</value>
   </data>
 
   <!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -1699,10 +1723,10 @@ Are you sure?</value>
 
   <!-- ═══════════════════════ Parental Controls ═════════════════════════ -->
   <data name="Settings_Parental" xml:space="preserve">
-    <value>Tung Tung</value>
+    <value>Steam Family</value>
   </data>
   <data name="Settings_ParentalHint" xml:space="preserve">
-    <value>Six...six seven?</value>
+    <value>Disable Steam Family restrictions</value>
   </data>
   <data name="Settings_ParentalIgnorePlaytime" xml:space="preserve">
     <value>Ignore Playtime Restrictions</value>

@@ -106,6 +106,10 @@
                 <ui:NavigationViewItem x:Name="NavCleanup"
                                          Icon="{ui:SymbolIcon Delete24}"
                                          Content="{res:Loc Nav_Cleanup}"
+                                         TargetPageType="{x:Type pages:CleanupPage}" />
+                <ui:NavigationViewItem x:Name="NavCloud760"
+                                         Icon="{ui:SymbolIcon CloudDismiss24}"
+                                         Content="760 Cleanup"
                                          TargetPageType="{x:Type pages:Cloud760Page}" />
                 <ui:NavigationViewItem Content="{res:Loc Nav_ManifestPinning}"
                                          Icon="{ui:SymbolIcon Pin24}"
