@@ -28,8 +28,6 @@ void SetAccountId(uint32_t id);
 // Set the Steam path (called by Linux hook layer during init)
 void SetSteamPath(const std::string& path);
 
-void RecordLaunchTime(uint32_t appId);
-
 // Signal shutdown
 void Shutdown();
 

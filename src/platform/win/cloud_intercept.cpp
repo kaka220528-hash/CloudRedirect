@@ -1,6 +1,8 @@
 #include "cloud_intercept.h"
 #include "metadata_sync.h"
 #include "rpc_handlers.h"
+#include "stats_handlers.h"
+#include "stats_store.h"
 #include "app_state.h"
 #include "protobuf.h"
 #include "parental_bypass.h"
@@ -120,10 +122,6 @@ static constexpr uintptr_t SC_RVA_SERVICE_TRANSPORT_VT = 0x1247A70;
 static constexpr uintptr_t SC_RVA_PARSE_FROM_ARRAY  = 0xBC42F0;
 // sub_138BE7A40 = protobuf SerializeToArray (writes body to raw bytes)
 static constexpr uintptr_t SC_RVA_SERIALIZE_TO_ARRAY = 0xBC4700;
-// CUser playtime state helpers
-static constexpr uintptr_t SC_RVA_GET_APP_MINUTES_PLAYED_DATA = 0x9BB320;
-static constexpr uintptr_t SC_RVA_FLUSH_APP_MINUTES_PLAYED = 0x9CB7D0;
-static constexpr uintptr_t SC_RVA_SET_APP_LAST_PLAYED_TIME = 0x9CE600;
 // CSteamEngine layout offsets
 static constexpr uint32_t ENGINE_OFF_JOBMGR          = 592;    // CJobMgr embedded at CSteamEngine+592
 static constexpr uint32_t ENGINE_OFF_GLOBAL_HANDLE   = 3144;  // uint32_t: global user handle
@@ -189,9 +187,6 @@ using ParseFromArrayFn = char(__fastcall*)(void* msgBody, const char* data, int 
 //   r8  = buffer size (int)
 //   returns end pointer on old Steam, flag on Steam >= 1778281814
 using SerializeToArrayFn = uintptr_t(__fastcall*)(void* msgBody, void* outBuf, int size);
-using GetAppMinutesPlayedDataFn = unsigned int*(__fastcall*)(int64_t userPtr, unsigned int appId, char create);
-using FlushAppMinutesPlayedFn = int64_t(__fastcall*)(int64_t userPtr, unsigned int appId, unsigned int* record);
-using SetAppLastPlayedTimeFn = void(__fastcall*)(int64_t userPtr, unsigned int appId, unsigned int lastPlayed);
 
 // Job routing info struct passed as 4th arg to BRouteMsgToJob
 // Layout from RecvPkt assembly (naturally aligned, 24 bytes, no padding needed):
@@ -306,8 +301,6 @@ static void ScheduleStartupMetadataSync() {
     LOG("[StartupSync] Cloud active; metadata will be fetched on-demand per app");
 }
 
-#define g_syncAchievements MetadataSync::syncAchievements
-#define g_syncPlaytime MetadataSync::syncPlaytime
 #define g_syncLuas MetadataSync::syncLuas
 
 static std::atomic<bool> g_parentalBypassPlaytime{false};
@@ -479,40 +472,7 @@ void SetNamespaceApps(const uint32_t* appIds, uint32_t count,
     g_namespaceApps = std::move(next);
 }
 
-// per-app launch timestamp for internal playtime tracking
-static std::mutex g_launchTimeMutex;
-static std::unordered_map<uint32_t, time_t> g_launchTimes;
-static std::unordered_map<uint32_t, uint64_t> g_launchVdfPlaytime;
-static std::unordered_map<uint32_t, uint64_t> g_launchVdfPlaytime2wks;
-
-static uint32_t ClampToUint32(uint64_t value) {
-    return value > (std::numeric_limits<uint32_t>::max)()
-        ? (std::numeric_limits<uint32_t>::max)()
-        : static_cast<uint32_t>(value);
-}
-
 static uintptr_t FindCurrentUser();
-
-static uintptr_t ResolveCurrentUserForRestore(const char* featureTag, uint32_t appId) {
-    if (!g_steamClientBase) {
-        HMODULE hSC = GetModuleHandleA("steamclient64.dll");
-        if (!hSC) {
-            LOG("[%s] In-memory restore skipped for app %u: steamclient64.dll not loaded", featureTag, appId);
-            return 0;
-        }
-        g_steamClientBase = (uintptr_t)hSC;
-    }
-
-    uintptr_t userPtr = 0;
-    for (int attempt = 0; attempt < 20 && !userPtr && !g_shuttingDown.load(); ++attempt) {
-        userPtr = FindCurrentUser();
-        if (!userPtr) Sleep(100);
-    }
-    if (!userPtr) {
-        LOG("[%s] In-memory restore skipped for app %u: current CUser not available", featureTag, appId);
-    }
-    return userPtr;
-}
 
 static uintptr_t FindCurrentUser() {
     if (!g_steamClientBase) {
@@ -556,143 +516,6 @@ static uintptr_t FindCurrentUser() {
     return userPtr;
 }
 
-void RecordLaunchTime(uint32_t appId) {
-    std::lock_guard<std::mutex> lock(g_launchTimeMutex);
-    g_launchTimes[appId] = time(nullptr);
-
-    // Snapshot VDF playtime at launch while the file is stable
-    uint64_t vdfPT = 0;
-    uint64_t vdfPT2wks = 0;
-    uint32_t accountId = GetAccountId();
-    if (accountId) {
-        std::string vdfPath = g_steamPath + "userdata\\" + std::to_string(accountId)
-            + "\\config\\localconfig.vdf";
-        // Wide-API: CreateFileA's ACP narrowing breaks non-ASCII profile paths (Cyrillic/CJK), which would silently skip the playtime baseline.
-        auto vdfPathWide = FileUtil::Utf8ToPath(vdfPath).wstring();
-        HANDLE hFile = CreateFileW(vdfPathWide.c_str(), GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD fileSize = GetFileSize(hFile, nullptr);
-            std::string vdfContent;
-            if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
-                vdfContent.resize(fileSize);
-                DWORD bytesRead = 0;
-                ReadFile(hFile, (LPVOID)vdfContent.data(), fileSize, &bytesRead, nullptr);
-                vdfContent.resize(bytesRead);
-            }
-            CloseHandle(hFile);
-
-            std::string appIdStr = std::to_string(appId);
-            const char* sections[] = { "UserLocalConfigStore", "Software", "Valve", "Steam", "Apps", appIdStr.c_str() };
-            VdfUtil::ForEachFieldInSection(vdfContent, sections, 6,
-                [&](const VdfUtil::FieldInfo& fi) {
-                    if (fi.key == "Playtime")
-                        vdfPT = strtoull(std::string(fi.value).c_str(), nullptr, 10);
-                    else if (fi.key == "Playtime2wks")
-                        vdfPT2wks = strtoull(std::string(fi.value).c_str(), nullptr, 10);
-                    return true;
-                });
-        }
-    }
-    g_launchVdfPlaytime[appId] = vdfPT;
-    g_launchVdfPlaytime2wks[appId] = vdfPT2wks;
-    LOG("[Playtime] Recorded launch time for app %u (vdfBaseline=%llu min, vdf2wks=%llu min)",
-        appId, vdfPT, vdfPT2wks);
-}
-
-struct LaunchInfo { time_t launchTime; uint64_t vdfBaseline; uint64_t vdfBaseline2wks; };
-static LaunchInfo PopLaunchInfo(uint32_t appId) {
-    std::lock_guard<std::mutex> lock(g_launchTimeMutex);
-    LaunchInfo info = {0, 0, 0};
-    auto it = g_launchTimes.find(appId);
-    if (it != g_launchTimes.end()) {
-        info.launchTime = it->second;
-        g_launchTimes.erase(it);
-    }
-    auto it2 = g_launchVdfPlaytime.find(appId);
-    if (it2 != g_launchVdfPlaytime.end()) {
-        info.vdfBaseline = it2->second;
-        g_launchVdfPlaytime.erase(it2);
-    }
-    auto it3 = g_launchVdfPlaytime2wks.find(appId);
-    if (it3 != g_launchVdfPlaytime2wks.end()) {
-        info.vdfBaseline2wks = it3->second;
-        g_launchVdfPlaytime2wks.erase(it3);
-    }
-    return info;
-}
-
-bool RestorePlaytimeState(uint32_t appId, uint64_t playtime, uint64_t playtime2wks) {
-    if (!playtime && !playtime2wks) return false;
-
-    uintptr_t userPtr = ResolveCurrentUserForRestore("Playtime", appId);
-    if (!userPtr) return false;
-
-    auto getData = (GetAppMinutesPlayedDataFn)(g_steamClientBase + SC_RVA_GET_APP_MINUTES_PLAYED_DATA);
-    auto flushData = (FlushAppMinutesPlayedFn)(g_steamClientBase + SC_RVA_FLUSH_APP_MINUTES_PLAYED);
-
-    unsigned int* record = nullptr;
-    __try {
-        record = getData((int64_t)userPtr, appId, 1);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[Playtime] In-memory restore exception creating record for app %u: code=0x%08lX",
-            appId, GetExceptionCode());
-        return false;
-    }
-    if (!record) {
-        LOG("[Playtime] In-memory restore failed for app %u: no playtime record", appId);
-        return false;
-    }
-
-    uint32_t total32 = ClampToUint32(playtime);
-    uint32_t twoWks32 = ClampToUint32(playtime2wks ? playtime2wks : playtime);
-    uint32_t oldTotal = 0;
-    uint32_t oldTwoWks = 0;
-
-    __try {
-        oldTotal = record[1];
-        oldTwoWks = record[2];
-        if (oldTotal > total32) total32 = oldTotal;
-        if (oldTwoWks > twoWks32) twoWks32 = oldTwoWks;
-        record[1] = total32;
-        record[2] = twoWks32;
-        record[3] = 0;
-        record[4] = 0;
-        record[5] = 0;
-        record[6] = 0;
-        flushData((int64_t)userPtr, appId, record);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[Playtime] In-memory restore exception applying record for app %u: code=0x%08lX",
-            appId, GetExceptionCode());
-        return false;
-    }
-
-    LOG("[Playtime] Seeded in-memory playtime for app %u: total %u->%u, 2wks %u->%u",
-        appId, oldTotal, total32, oldTwoWks, twoWks32);
-    return true;
-}
-
-bool RestoreLastPlayedState(uint32_t appId, uint64_t lastPlayed) {
-    if (!lastPlayed) return false;
-
-    uintptr_t userPtr = ResolveCurrentUserForRestore("Playtime", appId);
-    if (!userPtr) return false;
-
-    auto setLastPlayed = (SetAppLastPlayedTimeFn)(g_steamClientBase + SC_RVA_SET_APP_LAST_PLAYED_TIME);
-
-    uint32_t lastPlayed32 = ClampToUint32(lastPlayed);
-    __try {
-        setLastPlayed((int64_t)userPtr, appId, lastPlayed32);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[Playtime] In-memory LastPlayed restore exception for app %u: code=0x%08lX",
-            appId, GetExceptionCode());
-        return false;
-    }
-
-    LOG("[Playtime] Seeded in-memory LastPlayed for app %u: %u", appId, lastPlayed32);
-    return true;
-}
 
 // cave replacement buffer globals (still needed for passthrough SteamTools hook)
 
@@ -1373,6 +1196,33 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         return result;
     }
 
+    // Native Player.GetUserStats#1 (per IDA, this lands on slot 4 / vtable+32).
+    // Bodies here are RAW protobuf objects (no CProtoBufMsg +48 wrapper).
+    if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0) {
+        if (requestBody && responseBody && g_serializeToArray) {
+            auto reqBytes = SerializeBodyToBytes(requestBody);
+            auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
+            uint32_t appId = 0;
+            if (auto* f = PB::FindField(reqFields, 2)) appId = (uint32_t)f->varintVal; // appid #2
+            LOG("[Stats] slot4 GetUserStats seen: app=%u namespace=%d", appId, IsNamespaceApp(appId) ? 1 : 0);
+            if (appId != 0 && IsNamespaceApp(appId)) {
+                auto res = StatsHandlers::HandleGetUserStats(appId, reqFields);
+                if (res.body.Size() > 0 &&
+                    ParseBytesToBody(responseBody, res.body.Data().data(), res.body.Size())) {
+                    if (flags) { flags[2] = 1; flags[3] = res.eresult; }
+                    LOG("[Stats] GetUserStats app=%u handled locally via slot4 (%zu bytes)",
+                        appId, res.body.Size());
+                    return true;
+                }
+                LOG("[Stats] GetUserStats app=%u slot4 NOT handled (bodySize=%zu) -> passthrough",
+                    appId, res.body.Size());
+            }
+        } else {
+            LOG("[Stats] slot4 GetUserStats: missing req/resp/serializer -> passthrough");
+        }
+        return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
+    }
+
     if (strncmp(methodName, "Cloud.", 6) != 0) {
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
@@ -1492,6 +1342,93 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         }
         return result;
     }
+
+    // ---- Native stats / playtime service RPCs --------------------------------
+    // Player.GetUserStats#1 (per-app): for namespace apps, answer from our store.
+    // Player.ClientGetLastPlayedTimes#1 (account-wide): let the real server reply,
+    // then APPEND our namespace apps' playtime so Steam shows it. Real owned games
+    // keep their server playtime (the client merges per-appid). See IDA notes.
+    if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0) {
+        if (request && response) {
+            void* reqBody = *(void**)((uintptr_t)request + 48);
+            if (reqBody) {
+                auto reqBytes = SerializeBodyToBytes(reqBody);
+                auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
+                // appid is field 2 in CPlayer_GetUserStats_Request (IDA-verified)
+                uint32_t appId = 0;
+                if (auto* f = PB::FindField(reqFields, 2)) appId = (uint32_t)f->varintVal;
+                LOG("[Stats] slot5 GetUserStats seen: app=%u namespace=%d", appId, IsNamespaceApp(appId) ? 1 : 0);
+                if (appId != 0 && IsNamespaceApp(appId)) {
+                    auto res = StatsHandlers::HandleGetUserStats(appId, reqFields);
+                    void* respBody = *(void**)((uintptr_t)response + 48);
+                    if (respBody && res.body.Size() > 0 &&
+                        ParseBytesToBody(respBody, res.body.Data().data(), res.body.Size())) {
+                        if (flags) *flags = 0;
+                        LOG("[Stats] GetUserStats app=%u handled locally (%zu bytes)",
+                            appId, res.body.Size());
+                        return true;
+                    }
+                    LOG("[Stats] GetUserStats app=%u NOT handled (respBody=%p bodySize=%zu) -> passthrough",
+                        appId, *(void**)((uintptr_t)response + 48), res.body.Size());
+                }
+            } else {
+                LOG("[Stats] slot5 GetUserStats: null reqBody -> passthrough");
+            }
+        }
+        return g_originalSlot5(thisptr, methodName, request, response, flags);
+    }
+
+    if (strcmp(methodName, StatsHandlers::RPC_GET_LAST_PLAYED) == 0) {
+        bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
+        LOG("[Stats] slot5 GetLastPlayedTimes seen: serverResult=%d", result ? 1 : 0);
+        if (result && response) {
+            void* respBody = *(void**)((uintptr_t)response + 48);
+            if (respBody) {
+                // Parse the request to honor min_last_played.
+                std::vector<PB::Field> reqFields;
+                if (request) {
+                    void* reqBody = *(void**)((uintptr_t)request + 48);
+                    if (reqBody) {
+                        auto reqBytes = SerializeBodyToBytes(reqBody);
+                        reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
+                    }
+                }
+                auto ours = StatsHandlers::HandleGetLastPlayedTimes(reqFields);
+                if (ours.body.Size() > 0) {
+                    // Append our games[] (field 1) to the server's response.
+                    auto respBytes = SerializeBodyToBytes(respBody);
+                    PB::Writer merged;
+                    // keep all existing fields verbatim
+                    auto existing = PB::Parse(respBytes.data(), respBytes.size());
+                    for (const auto& f : existing) {
+                        if (f.wireType == PB::Varint)            merged.WriteVarint(f.fieldNum, f.varintVal);
+                        else if (f.wireType == PB::Fixed64)      merged.WriteFixed64(f.fieldNum, f.varintVal);
+                        else if (f.wireType == PB::Fixed32)      merged.WriteFixed32(f.fieldNum, (uint32_t)f.varintVal);
+                        else if (f.wireType == PB::LengthDelimited) merged.WriteBytes(f.fieldNum, f.data, f.dataLen);
+                    }
+                    // append our games (each game is a length-delimited field 1)
+                    auto ourFields = PB::Parse(ours.body.Data().data(), ours.body.Size());
+                    size_t added = 0;
+                    for (const auto& f : ourFields) {
+                        if (f.fieldNum == 1 && f.wireType == PB::LengthDelimited) {
+                            merged.WriteBytes(1, f.data, f.dataLen);
+                            ++added;
+                        }
+                    }
+                    if (added > 0 &&
+                        ParseBytesToBody(respBody, merged.Data().data(), merged.Size())) {
+                        LOG("[Stats] GetLastPlayedTimes: appended %zu local game(s) to server response", added);
+                    } else {
+                        LOG("[Stats] GetLastPlayedTimes: nothing appended (added=%zu)", added);
+                    }
+                } else {
+                    LOG("[Stats] GetLastPlayedTimes: store had no local games to append");
+                }
+            }
+        }
+        return result;
+    }
+    // --------------------------------------------------------------------------
 
     if (strncmp(methodName, "Cloud.", 6) != 0) {
         return g_originalSlot5(thisptr, methodName, request, response, flags);
@@ -1675,244 +1612,6 @@ static uint32_t CheckNotificationNamespaceApp(const char* methodName, void* body
     return 0;
 }
 
-// On namespace-app exit: read appcache/stats/UserGameStats_{account}_{app}.bin and store as a cross-machine restore blob.
-static void UploadStatsOnExit(uint32_t appId) {
-    if (!CloudStorage::IsCloudActive()) return;
-
-    uint32_t accountId = GetAccountId();
-    if (!accountId) return;
-
-    std::string statsFile = g_steamPath + "appcache\\stats\\UserGameStats_"
-        + std::to_string(accountId) + "_" + std::to_string(appId) + ".bin";
-
-    // Wide-API: CreateFileA narrows via ACP and fails for non-ASCII Steam
-    // install roots, silently skipping stats upload for affected users.
-    auto statsFileWide = FileUtil::Utf8ToPath(statsFile).wstring();
-    HANDLE hFile = CreateFileW(statsFileWide.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        LOG("[Stats] No stats file for app %u, skipping upload", appId);
-        return;
-    }
-
-    LARGE_INTEGER fileSize;
-    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart <= 0 || fileSize.QuadPart > 50 * 1024 * 1024) {
-        LOG("[Stats] Stats file empty or too large for app %u (%lld bytes), skipping upload",
-            appId, fileSize.QuadPart);
-        CloseHandle(hFile);
-        return;
-    }
-
-    std::vector<uint8_t> data(static_cast<size_t>(fileSize.QuadPart));
-    DWORD bytesRead = 0;
-    BOOL readOk = ReadFile(hFile, data.data(), static_cast<DWORD>(data.size()), &bytesRead, nullptr);
-    CloseHandle(hFile);
-
-    if (!readOk || bytesRead != data.size()) {
-        LOG("[Stats] Failed to read stats file for app %u", appId);
-        return;
-    }
-
-    // Steam writes a 38-byte cache{crc,PendingChanges}+END skeleton when no stats
-    // are loaded; uploading it clobbers a richer cloud blob. 64-byte floor matches
-    // PreStage threshold.
-    if (data.size() <= 64) {
-        LOG("[Stats] Skipping upload for app %u: file too small (%zu bytes), likely empty stub",
-            appId, data.size());
-        return;
-    }
-    if (!StatsBlobHasUnlocks(data.data(), data.size())) {
-        LOG("[Stats] Skipping upload for app %u: blob has no unlocked stats/achievements (%zu bytes)",
-            appId, data.size());
-        return;
-    }
-
-    // Account-scoped sentinel (appId=0): keeps blob out of per-app namespace so Steam never resolves it under an AutoCloud root. See cloud_metadata_paths.h.
-    bool ok = CloudStorage::StoreBlob(accountId, kAccountScopeAppId,
-        AccountStatsFilename(appId), data.data(), data.size());
-    LOG("[Stats] Uploaded stats for app %u (%zu bytes, ok=%d)", appId, data.size(), ok);
-
-    if (ok) {
-        CloudStorage::DeleteBlob(accountId, appId, kLegacyStatsMetadataPath);
-    }
-}
-
-// Upload playtime on namespace-app exit. Internal launch->exit delta + launch-time VDF baseline (exit-side VDF is unreliable - Steam may not have written it yet).
-static void UploadPlaytimeOnExit(uint32_t appId) {
-    if (!CloudStorage::IsCloudActive()) return;
-
-    uint32_t accountId = GetAccountId();
-    if (!accountId) return;
-
-    auto info = PopLaunchInfo(appId);
-    time_t now = time(nullptr);
-
-    uint64_t trackedMinutes = 0;
-    uint64_t trackedLastPlayed = (uint64_t)now;
-
-    if (info.launchTime > 0 && now > info.launchTime) {
-        trackedMinutes = (uint64_t)(now - info.launchTime) / 60;
-        LOG("[Playtime] Internal tracking for app %u: %llu minutes (baseline=%llu)", appId, trackedMinutes, info.vdfBaseline);
-    } else {
-        LOG("[Playtime] No internal launch time for app %u, relying on VDF", appId);
-    }
-
-    // Read Steam's cumulative playtime from localconfig.vdf (if available).
-    // Use Win32 API with shared access since Steam may have the file open.
-    uint64_t vdfLastPlayed = 0, vdfPlaytime = 0, vdfPlaytime2wks = 0;
-    {
-        std::string vdfPath = g_steamPath + "userdata\\" + std::to_string(accountId)
-            + "\\config\\localconfig.vdf";
-        // Wide-API parity with the launch-time reader above; see UploadStatsOnExit.
-        auto vdfPathWide = FileUtil::Utf8ToPath(vdfPath).wstring();
-        HANDLE hFile = CreateFileW(vdfPathWide.c_str(), GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD fileSize = GetFileSize(hFile, nullptr);
-            std::string vdfContent;
-            if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
-                vdfContent.resize(fileSize);
-                DWORD bytesRead = 0;
-                ReadFile(hFile, (LPVOID)vdfContent.data(), fileSize, &bytesRead, nullptr);
-                vdfContent.resize(bytesRead);
-            }
-            CloseHandle(hFile);
-
-            std::string appIdStr = std::to_string(appId);
-            const char* sections[] = { "UserLocalConfigStore", "Software", "Valve", "Steam", "Apps", appIdStr.c_str() };
-            bool sectionFound = VdfUtil::ForEachFieldInSection(vdfContent, sections, 6,
-                [&](const VdfUtil::FieldInfo& fi) {
-                    if (fi.key == "LastPlayed")
-                        vdfLastPlayed = strtoull(std::string(fi.value).c_str(), nullptr, 10);
-                    else if (fi.key == "Playtime")
-                        vdfPlaytime = strtoull(std::string(fi.value).c_str(), nullptr, 10);
-                    else if (fi.key == "Playtime2wks")
-                        vdfPlaytime2wks = strtoull(std::string(fi.value).c_str(), nullptr, 10);
-                    return true;
-                });
-            LOG("[Playtime] VDF for app %u: found=%d Playtime=%llu Playtime2wks=%llu LastPlayed=%llu (read %lu bytes)",
-                appId, sectionFound, vdfPlaytime, vdfPlaytime2wks, vdfLastPlayed, (unsigned long)vdfContent.size());
-        } else {
-            LOG("[Playtime] Cannot open localconfig.vdf for app %u (err=%lu, path=%s)",
-                appId, GetLastError(), vdfPath.c_str());
-        }
-    }
-
-    // Use the launch-time VDF baseline if exit-side read came back empty.
-    // Steam may not have flushed playtime to disk yet at exit time.
-    if (vdfPlaytime == 0 && info.vdfBaseline > 0) {
-        vdfPlaytime = info.vdfBaseline;
-        LOG("[Playtime] Using launch-time VDF baseline for app %u: %llu min", appId, vdfPlaytime);
-    }
-    if (vdfPlaytime2wks == 0 && info.vdfBaseline2wks > 0) {
-        vdfPlaytime2wks = info.vdfBaseline2wks;
-        LOG("[Playtime] Using launch-time 2wks VDF baseline for app %u: %llu min", appId, vdfPlaytime2wks);
-    }
-
-    uint64_t lastPlayed = (trackedLastPlayed > vdfLastPlayed) ? trackedLastPlayed : vdfLastPlayed;
-
-    // Merge with existing blob; CheckBlobExists distinguishes Missing (merge with empty) from Error (abort) - RetrieveBlob alone would silently overwrite on transient failure.
-    uint64_t cloudLastPlayed = 0, cloudPlaytime = 0, cloudPlaytime2wks = 0;
-    auto acctScopeStatus = CloudStorage::CheckBlobExists(
-        accountId, kAccountScopeAppId, AccountPlaytimeFilename(appId));
-    if (acctScopeStatus == ICloudProvider::ExistsStatus::Error) {
-        LOG("[Playtime] account-scope existence check returned Error for app %u; "
-            "aborting upload to avoid stale-merge rollback", appId);
-        return;
-    }
-    std::vector<uint8_t> ptData;
-    if (acctScopeStatus == ICloudProvider::ExistsStatus::Exists) {
-        ptData = CloudStorage::RetrieveBlob(accountId, kAccountScopeAppId,
-                                             AccountPlaytimeFilename(appId));
-        // Empty after Exists means the download itself failed; abort
-        // matches the Error path above (our writer never emits empty).
-        if (ptData.empty()) {
-            LOG("[Playtime] account-scope retrieve returned empty after Exists for app %u; "
-                "aborting upload to avoid stale-merge rollback", appId);
-            return;
-        }
-    }
-    if (!ptData.empty()) {
-        std::string blob(reinterpret_cast<const char*>(ptData.data()), ptData.size());
-        auto parsed = Json::Parse(blob);
-        if (parsed.type == Json::Type::Object) {
-            if (parsed.has("LastPlayed"))
-                cloudLastPlayed = (parsed["LastPlayed"].type == Json::Type::Number)
-                    ? (parsed["LastPlayed"].number() > 0 ? (uint64_t)parsed["LastPlayed"].number() : 0)
-                    : strtoull(parsed["LastPlayed"].str().c_str(), nullptr, 10);
-            if (parsed.has("Playtime"))
-                cloudPlaytime = (parsed["Playtime"].type == Json::Type::Number)
-                    ? (parsed["Playtime"].number() > 0 ? (uint64_t)parsed["Playtime"].number() : 0)
-                    : strtoull(parsed["Playtime"].str().c_str(), nullptr, 10);
-            if (parsed.has("Playtime2wks"))
-                cloudPlaytime2wks = (parsed["Playtime2wks"].type == Json::Type::Number)
-                    ? (parsed["Playtime2wks"].number() > 0 ? (uint64_t)parsed["Playtime2wks"].number() : 0)
-                    : strtoull(parsed["Playtime2wks"].str().c_str(), nullptr, 10);
-        } else {
-            std::istringstream blobStream(blob);
-            std::string blobLine;
-            while (std::getline(blobStream, blobLine)) {
-                size_t tab = blobLine.find('\t');
-                if (tab == std::string::npos) continue;
-                std::string key = blobLine.substr(0, tab);
-                std::string val = blobLine.substr(tab + 1);
-                if (key == "LastPlayed") cloudLastPlayed = strtoull(val.c_str(), nullptr, 10);
-                else if (key == "Playtime") cloudPlaytime = strtoull(val.c_str(), nullptr, 10);
-                else if (key == "Playtime2wks") cloudPlaytime2wks = strtoull(val.c_str(), nullptr, 10);
-            }
-        }
-    }
-    // Steam decays Playtime2wks; never default it to lifetime total.
-    // Clamp corrupt blobs (2wks > total) by zeroing 2wks.
-    // 2wks==total at non-trivial lifetimes is the signature of the prior
-    // "default 2wks to lifetime" bug; recover by zeroing.
-    constexpr uint64_t kTwoWeeksMinutes = 14ULL * 24 * 60;
-    if (cloudPlaytime2wks > cloudPlaytime ||
-        (cloudPlaytime2wks == cloudPlaytime && cloudPlaytime > kTwoWeeksMinutes))
-        cloudPlaytime2wks = 0;
-
-    // Playtime merge: baseline + session, but never less than VDF or cloud
-    uint64_t mergedPlaytime = cloudPlaytime + trackedMinutes;
-    if (vdfPlaytime > mergedPlaytime)
-        mergedPlaytime = vdfPlaytime;
-    if (info.vdfBaseline + trackedMinutes > mergedPlaytime)
-        mergedPlaytime = info.vdfBaseline + trackedMinutes;
-    uint64_t mergedPlaytime2wks = cloudPlaytime2wks + trackedMinutes;
-    if (vdfPlaytime2wks > mergedPlaytime2wks)
-        mergedPlaytime2wks = vdfPlaytime2wks;
-    if (info.vdfBaseline2wks + trackedMinutes > mergedPlaytime2wks)
-        mergedPlaytime2wks = info.vdfBaseline2wks + trackedMinutes;
-    // Never let recent exceed lifetime; safer to under-report than poison cloud.
-    if (mergedPlaytime2wks > mergedPlaytime)
-        mergedPlaytime2wks = mergedPlaytime;
-    uint64_t mergedLastPlayed = (lastPlayed > cloudLastPlayed) ? lastPlayed : cloudLastPlayed;
-
-    if (mergedPlaytime == 0 && mergedPlaytime2wks == 0 && mergedLastPlayed == 0) {
-        LOG("[Playtime] No playtime data for app %u (no tracking, no VDF, no cloud)", appId);
-        return;
-    }
-
-    Json::Value obj = Json::Object();
-    obj.objVal["LastPlayed"] = Json::String(std::to_string(mergedLastPlayed));
-    obj.objVal["Playtime"] = Json::String(std::to_string(mergedPlaytime));
-    obj.objVal["Playtime2wks"] = Json::String(std::to_string(mergedPlaytime2wks));
-    std::string blobStr = Json::Stringify(obj);
-
-    // Account-scoped sentinel (appId=0): keeps blob out of per-app namespace so Steam never resolves it under an AutoCloud root. See cloud_metadata_paths.h.
-    bool ok = CloudStorage::StoreBlob(accountId, kAccountScopeAppId,
-        AccountPlaytimeFilename(appId),
-        reinterpret_cast<const uint8_t*>(blobStr.data()), blobStr.size());
-    LOG("[Playtime] Uploaded playtime for app %u (session=%llu min, baseline=%llu min, baseline2wks=%llu min, vdf=%llu min, vdf2wks=%llu min, cloud=%llu min, cloud2wks=%llu min, total=%llu min, 2wks=%llu min, LastPlayed=%llu, ok=%d)",
-        appId, trackedMinutes, info.vdfBaseline, info.vdfBaseline2wks, vdfPlaytime, vdfPlaytime2wks,
-        cloudPlaytime, cloudPlaytime2wks, mergedPlaytime, mergedPlaytime2wks, mergedLastPlayed, ok);
-
-    if (ok) {
-        CloudStorage::DeleteBlob(accountId, appId, kLegacyPlaytimeMetadataPath);
-    }
-}
-
 // Slot 8 hook - Notification wrapper (e.g. SignalAppExitSyncDone)
 // request is a CProtoBufMsg* with body at +48, header at +40
 static bool __fastcall NotificationWrapperHook(void* thisptr, const char* methodName, void* request) {
@@ -1991,19 +1690,6 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
                 uploadsCompleted, uploadsRequired, clientId);
             // Release cloud session lock -- server-faithful: sync done, release ownership.
             CloudStorage::ReleaseCloudSession(accountId, realAppId, clientId);
-        }
-        if (!g_shuttingDown.load(std::memory_order_acquire) && MetadataSync::IsEnabled()) {
-            uint32_t capturedAppId = realAppId;
-            std::thread t([capturedAppId] {
-                if (g_syncAchievements) UploadStatsOnExit(capturedAppId);
-                if (g_syncPlaytime) UploadPlaytimeOnExit(capturedAppId);
-            });
-            std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
-            if (g_shuttingDown.load(std::memory_order_acquire)) {
-                t.detach();
-            } else {
-                g_bgThreads.push_back(std::move(t));
-            }
         }
         LOG("[VtHook-Notif] %s app=%u: letting Steam process internally", methodName, realAppId);
         return g_originalSlot8(thisptr, methodName, request);
@@ -3302,81 +2988,6 @@ static bool IsSelfUnlockingLua(const std::string& filePath, uint32_t appId) {
     return false;
 }
 
-// Stage cached UserGameStats into appcache/stats/ before Steam's one-shot startup load.
-static void PreStageStatsFromLocalCache(const std::string& steamPath) {
-    std::string storageRoot = steamPath + "cloud_redirect\\storage\\";
-    std::string statsRoot = steamPath + "appcache\\stats\\";
-
-    auto storageRootWide = FileUtil::Utf8ToPath(storageRoot).wstring();
-    DWORD attrs = GetFileAttributesW(storageRootWide.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
-        return;
-
-    auto statsRootWide = FileUtil::Utf8ToPath(statsRoot).wstring();
-    if (GetFileAttributesW(statsRootWide.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::error_code ec;
-        std::filesystem::create_directories(FileUtil::Utf8ToPath(statsRoot), ec);
-    }
-
-    int staged = 0;
-    int skipped = 0;
-    WIN32_FIND_DATAW acctFd;
-    HANDLE hAcct = FindFirstFileW((storageRootWide + L"*").c_str(), &acctFd);
-    if (hAcct == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!(acctFd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        std::wstring acctName = acctFd.cFileName;
-        if (acctName == L"." || acctName == L"..") continue;
-        bool allDigits = !acctName.empty();
-        for (wchar_t c : acctName) { if (c < L'0' || c > L'9') { allDigits = false; break; } }
-        if (!allDigits) continue;
-
-        std::wstring statsDir = storageRootWide + acctName + L"\\0\\UserGameStats\\";
-        if (GetFileAttributesW(statsDir.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-
-        WIN32_FIND_DATAW appFd;
-        HANDLE hApp = FindFirstFileW((statsDir + L"*.bin").c_str(), &appFd);
-        if (hApp == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (appFd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::wstring appBin = appFd.cFileName;
-            if (appBin.size() < 5) continue;
-            std::wstring appStem = appBin.substr(0, appBin.size() - 4);
-            bool appDigits = !appStem.empty();
-            for (wchar_t c : appStem) { if (c < L'0' || c > L'9') { appDigits = false; break; } }
-            if (!appDigits) continue;
-
-            std::wstring srcPath = statsDir + appBin;
-            std::wstring dstPath = statsRootWide + L"UserGameStats_" + acctName + L"_" + appStem + L".bin";
-
-            // Steam writes a 38 B empty stub for unloaded apps; skip anything bigger.
-            WIN32_FILE_ATTRIBUTE_DATA dstAttr{};
-            bool dstExists = GetFileAttributesExW(dstPath.c_str(),
-                GetFileExInfoStandard, &dstAttr) != 0;
-            if (dstExists) {
-                ULARGE_INTEGER dstSize;
-                dstSize.LowPart = dstAttr.nFileSizeLow;
-                dstSize.HighPart = dstAttr.nFileSizeHigh;
-                if (dstSize.QuadPart > 64) {
-                    skipped++;
-                    continue;
-                }
-            }
-
-            if (CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE)) {
-                staged++;
-            } else {
-                LOG("[PreStage] CopyFile failed: %ls -> %ls (err=%lu)",
-                    srcPath.c_str(), dstPath.c_str(), GetLastError());
-            }
-        } while (FindNextFileW(hApp, &appFd));
-        FindClose(hApp);
-    } while (FindNextFileW(hAcct, &acctFd));
-    FindClose(hAcct);
-
-    if (staged > 0 || skipped > 0)
-        LOG("[PreStage] Staged %d UserGameStats files from local cache (skipped %d non-empty)", staged, skipped);
-}
 
 // DLL auto-update: check GitHub for a newer cloud_redirect.dll, replace on disk.
 
@@ -3786,9 +3397,6 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         LOG("Steam version: %llu (%s)", detectedVersion, versionOk ? "OK" : "UNSUPPORTED");
     else
         LOG("Steam version: UNKNOWN (manifest unreadable)");
-
-    if (MetadataSync::steamToolsPresent.load(std::memory_order_relaxed))
-        PreStageStatsFromLocalCache(g_steamPath);
 
     // Auto-detect namespace apps from {steamPath}\config\stplug-in\*.lua, restricted to self-unlocking luas (base-game addappid for own id).
     std::string pluginDir = g_steamPath + "config\\stplug-in\\*";
@@ -4220,12 +3828,8 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             HttpServer::SetMaxUploadMB(mb);
         }
 
-        // Stats/playtime/lua sync requires SteamTools.
+        // Lua sync requires SteamTools.
         if (MetadataSync::steamToolsPresent.load(std::memory_order_relaxed)) {
-            if (cfg["sync_achievements"].type == Json::Type::Bool)
-                MetadataSync::syncAchievements = cfg["sync_achievements"].boolean();
-            if (cfg["sync_playtime"].type == Json::Type::Bool)
-                MetadataSync::syncPlaytime = cfg["sync_playtime"].boolean();
             if (cfg["sync_luas"].type == Json::Type::Bool)
                 MetadataSync::syncLuas = cfg["sync_luas"].boolean();
         }
@@ -4262,6 +3866,36 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
 
     CloudStorage::Init(cloudRoot, std::move(provider));
     g_startupMetadataScheduled.store(false);
+
+    // Native stats / playtime store (cloud-backed). Must come after CloudStorage.
+    // Install cloud-backing callbacks so per-app stats blobs ride each app's
+    // Steam Cloud sync (same mechanism as CN/root-token metadata blobs).
+    StatsStore::SetCloudProvider(
+        // pull: download the per-app stats blob as text
+        [](uint32_t appId, std::string& outJson) -> bool {
+            uint32_t accountId = GetAccountId();
+            if (accountId == 0) return false;
+            std::vector<uint8_t> data;
+            if (!CloudStorage::DownloadCloudMetadataWithLegacyFallback(
+                    accountId, appId, "stats.json", nullptr, data) || data.empty())
+                return false;
+            outJson.assign(reinterpret_cast<const char*>(data.data()), data.size());
+            return true;
+        },
+        // push: upload the per-app stats blob (fire-and-forget)
+        [](uint32_t appId, const std::string& json) {
+            uint32_t accountId = GetAccountId();
+            if (accountId == 0) return;
+            CloudStorage::UploadCloudMetadataText(accountId, appId, "stats.json", json);
+        });
+    // Restrict all playtime/stats tracking to namespace/lua apps only -- real
+    // owned games must never have their playtime recorded or synced.
+    StatsHandlers::SetNamespacePredicate([](uint32_t appId) { return IsNamespaceApp(appId); });
+    // Resolve current accountId lazily so the store can import Steam's native
+    // UserGameStats blobs (appcache\stats\UserGameStats_<accountId>_<appId>.bin).
+    StatsStore::SetAccountIdProvider([]() -> uint32_t { return GetAccountId(); });
+    StatsStore::Init(cloudRoot, g_steamPath);
+    StatsHandlers::Init();
 
     SteamKvInjector::Init();
 
@@ -4452,7 +4086,17 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
 
             void* bodyObj = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_BODY);
             if (bodyObj) {
-                RewriteGamesPlayedBody(bodyObj);
+                // Observe games-played to track native playtime sessions, then
+                // rewrite for the non-Steam-game spoof. Observation reads only;
+                // it starts/ends StatsStore sessions by appid.
+                auto observeBytes = SerializeBodyToBytes(bodyObj);
+                if (!observeBytes.empty()) {
+                    LOG("[Stats] GamesPlayed observed (emsg=%u, %zu bytes) -> session tracking",
+                        emsg, observeBytes.size());
+                    StatsHandlers::ObserveGamesPlayed(observeBytes.data(), observeBytes.size());
+                }
+                if (g_showNonSteamGame.load(std::memory_order_relaxed))
+                    RewriteGamesPlayedBody(bodyObj);
             }
         }
     }
@@ -4462,10 +4106,9 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
 
 void InstallGamesPlayedHook() {
     if (!HasNamespaceApps()) return;
-    if (!g_showNonSteamGame.load(std::memory_order_relaxed)) {
-        LOG("[GamesPlayed] Disabled by config (show_non_steam_game=false)");
-        return;
-    }
+    // NOTE: always install. The hook serves two purposes: (1) playtime session
+    // tracking (ObserveGamesPlayed) which must run regardless of config, and
+    // (2) the non-Steam-game spoof, which is gated per-call on g_showNonSteamGame.
 
     HMODULE hSteamClient = GetModuleHandleA("steamclient64.dll");
     if (!hSteamClient) {
@@ -4993,6 +4636,10 @@ static void ShutdownImpl() {
             }
         }
     }
+
+    // Flush native stats / playtime to cloud now that hook calls are drained
+    // (ObserveGamesPlayed and the stats handlers can no longer touch the store).
+    StatsHandlers::Shutdown();
 
     // Restore vtable pointers before DLL unload, but skip if steamclient64
     // is gone (Steam's clean exit FreeLibrarys it before ExitProcess; the

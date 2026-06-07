@@ -47,7 +47,6 @@ set(COMMON_SOURCES
     src/common/protobuf.cpp
     src/common/json.cpp
     src/common/vdf.cpp
-    src/common/bkv_stats.cpp
     src/common/remotecache_repair.cpp
     src/common/manifest_store.cpp
     src/common/app_state.cpp
@@ -67,6 +66,8 @@ set(COMMON_SOURCES
     src/common/steam_kv_injector.cpp
     src/common/parental_bypass.cpp
     src/common/metadata_sync.cpp
+    src/common/stats_store.cpp
+    src/common/stats_handlers.cpp
     src/common/miniz.c
     src/common/miniz_tdef.c
     src/common/miniz_tinfl.c
@@ -233,13 +234,6 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     )
     target_include_directories(remotecache_repair_tests PRIVATE src/common)
     add_test(NAME remotecache_repair_tests COMMAND remotecache_repair_tests)
-
-    add_executable(bkv_stats_tests
-        tests/bkv_stats_tests.cpp
-        src/common/bkv_stats.cpp
-    )
-    target_include_directories(bkv_stats_tests PRIVATE src/common)
-    add_test(NAME bkv_stats_tests COMMAND bkv_stats_tests)
 
     add_executable(rpc_handlers_tests
         tests/rpc_handlers_tests.cpp

@@ -50,9 +50,6 @@ void SetAccountId(uint32_t accountId);
 // get the Steam installation path (with trailing backslash)
 const std::string& GetSteamPath();
 
-// record the launch timestamp for internal playtime tracking
-void RecordLaunchTime(uint32_t appId);
-
 void AddNamespaceApp(uint32_t appId);
 void RemoveNamespaceApp(uint32_t appId);
 bool IsNamespaceApp(uint32_t appId);
