@@ -1,6 +1,13 @@
 #!/bin/bash
-# Build script for CloudRedirect Flatpak
-# Run this on a Linux system with flatpak-builder installed
+# Build script for CloudRedirect Flatpak. LOCAL TEST INSTALL ONLY.
+#
+# This builds and installs the flatpak into your user installation so you can
+# run it locally. It does NOT export or sign a distributable repo.
+#
+# To publish a release to GitHub Pages, use release.sh instead. It builds,
+# SIGNS the OSTree summary, guards against an unsigned repo, and pushes gh-pages.
+# Publishing with this script would produce an unsigned repo that clients reject
+# ("GPG verification enabled, but no summary signatures found").
 
 set -e
 

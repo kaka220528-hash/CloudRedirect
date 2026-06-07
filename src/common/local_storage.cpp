@@ -62,7 +62,6 @@ using AutoCloudUtil::GetKnownFolderPathString;
 using AutoCloudUtil::IsSafeRelativePath;
 using AutoCloudUtil::kMaxAppInfoBytes;
 using AutoCloudUtil::kMaxAppInfoStrings;
-using AutoCloudUtil::kMaxAutoCloudCandidateBytes;
 using AutoCloudUtil::kMaxAutoCloudScanFiles;
 using AutoCloudUtil::kMaxAutoCloudScanMillis;
 using AutoCloudUtil::NormalizeSlashes;

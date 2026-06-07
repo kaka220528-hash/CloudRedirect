@@ -18,6 +18,17 @@
 
 namespace SteamKvInjector {
 
+// Plausibility bounds for UFS quota; reject pointer-sized garbage reads.
+static constexpr uint64_t kMaxPlausibleQuotaBytes = 1024ULL * 1024 * 1024 * 1024; // 1 TiB
+static constexpr uint64_t kMaxPlausibleMaxFiles   = 10ULL * 1000 * 1000;          // 10M
+
+static bool QuotaValueLooksValid(uint64_t quota, uint64_t files) {
+    if (quota == 0 || files == 0) return false;
+    if (quota > kMaxPlausibleQuotaBytes) return false;
+    if (files > kMaxPlausibleMaxFiles)   return false;
+    return true;
+}
+
 #ifdef _WIN32
 
 // steamclient64.dll RVAs (IDA image base: 0x138000000)
@@ -41,7 +52,7 @@ static constexpr uintptr_t SC_RVA_GET_APP_INFO = 0x49D920;
 static constexpr uintptr_t SC_RVA_GET_SECTION = 0x49FC50;
 
 // CAppInfoCache::ReadAppConfigUint64(cache, appId, sectionId, keyName, defaultVal)
-static constexpr uintptr_t SC_RVA_READ_CONFIG_U64 = 0x49E930;
+static constexpr uintptr_t SC_RVA_READ_CONFIG_U64 = 0x49E990;
 
 // BlockOnInit -- calls CThread::Join off-engine-thread, crashes/deadlocks. Do not call.
 // Cache is already loaded before our RPC handlers run.
@@ -161,10 +172,21 @@ bool ReadAppQuota(uint32_t appId, uint64_t& outQuotaBytes, uint32_t& outMaxNumFi
     void* cache = GetCachePtr();
     if (!cache) return false;
 
-    // ReadAppConfigUint64 returns 0 on any miss; non-zero means PICS populated it
-    outQuotaBytes  = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
+    uint64_t quota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
     uint64_t files = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
-    outMaxNumFiles = (files > 0 && files <= UINT32_MAX) ? static_cast<uint32_t>(files) : 0;
+
+    if (!QuotaValueLooksValid(quota, files)) {
+        if (quota != 0 || files != 0) {
+            LOG("[KvInjector] ReadAppQuota app=%u: implausible quota=%llu files=%llu",
+                appId, (unsigned long long)quota, (unsigned long long)files);
+        }
+        outQuotaBytes = 0;
+        outMaxNumFiles = 0;
+        return true;
+    }
+
+    outQuotaBytes  = quota;
+    outMaxNumFiles = static_cast<uint32_t>(files);
     return true;
 }
 
@@ -221,22 +243,27 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
         return false;
     }
 
-    // Avoid clobbering Steam's own PICS-sourced values: check existing
-    // values via the same Steam-wrapper used everywhere else.
+    // Preserve Steam's PICS values only if plausible; overwrite garbage.
     uint64_t existingQuota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
     uint64_t existingFiles = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
+    bool existingValid = QuotaValueLooksValid(existingQuota, existingFiles);
 
     bool wroteQuota = false;
     bool wroteFiles = false;
 
-    if (existingQuota == 0) {
+    bool quotaNeedsWrite = (existingQuota == 0) ||
+                           (existingQuota > kMaxPlausibleQuotaBytes) || !existingValid;
+    bool filesNeedsWrite = (existingFiles == 0) ||
+                           (existingFiles > kMaxPlausibleMaxFiles) || !existingValid;
+
+    if (quotaNeedsWrite) {
         void* quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
         if (quotaKv) {
             g_r.kvSetUint64(quotaKv, quotaBytes);
             wroteQuota = true;
         }
     }
-    if (existingFiles == 0) {
+    if (filesNeedsWrite) {
         void* filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
         if (filesKv) {
             g_r.kvSetInt(filesKv, static_cast<int>(maxNumFiles));
@@ -256,6 +283,33 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
             (unsigned long long)existingQuota, (unsigned long long)existingFiles);
     }
     return true;
+}
+
+// Idempotently SET (not multiply) the live ufs quota/maxnumfiles to the given
+// values, capped to plausible maxima. Used by the mixed-root rule-multiplier
+// guard. Safe to call repeatedly with the same target.
+bool SetAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
+    if (!g_ready.load(std::memory_order_acquire)) return false;
+    if (quotaBytes == 0 || maxNumFiles == 0) return false;
+
+    void* cache = GetCachePtr();
+    if (!cache) return false;
+    void* appInfo = g_r.getAppInfo(cache, appId);
+    if (!appInfo) return false;
+    void* ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs) return false;
+
+    uint64_t newQuota = quotaBytes;
+    uint64_t newFiles = maxNumFiles;
+    if (newQuota > kMaxPlausibleQuotaBytes) newQuota = kMaxPlausibleQuotaBytes;
+    if (newFiles > kMaxPlausibleMaxFiles)   newFiles = kMaxPlausibleMaxFiles;
+
+    bool ok = false;
+    void* filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
+    if (filesKv) { g_r.kvSetInt(filesKv, static_cast<int>(newFiles)); ok = true; }
+    void* quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
+    if (quotaKv) { g_r.kvSetUint64(quotaKv, newQuota); ok = true; }
+    return ok;
 }
 
 bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
@@ -737,9 +791,21 @@ bool ReadAppQuota(uint32_t appId, uint64_t& outQuotaBytes, uint32_t& outMaxNumFi
     void* cache = GetCachePtr();
     if (!cache) return false;
 
-    outQuotaBytes  = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
+    uint64_t quota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
     uint64_t files = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
-    outMaxNumFiles = (files > 0 && files <= UINT32_MAX) ? static_cast<uint32_t>(files) : 0;
+
+    if (!QuotaValueLooksValid(quota, files)) {
+        if (quota != 0 || files != 0) {
+            LOG("[KvInjector] ReadAppQuota app=%u: implausible quota=%llu files=%llu",
+                appId, (unsigned long long)quota, (unsigned long long)files);
+        }
+        outQuotaBytes = 0;
+        outMaxNumFiles = 0;
+        return true;
+    }
+
+    outQuotaBytes  = quota;
+    outMaxNumFiles = static_cast<uint32_t>(files);
     return true;
 }
 
@@ -817,15 +883,20 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
         return false;
     }
 
-    // Use the same Steam wrapper to read existing values; if non-zero Steam's
-    // own PICS data is already in place and we should not clobber it.
+    // Preserve Steam's PICS values only if plausible; overwrite garbage.
     uint64_t existingQuota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
     uint64_t existingFiles = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
+    bool existingValid = QuotaValueLooksValid(existingQuota, existingFiles);
 
     bool wroteQuota = false;
     bool wroteFiles = false;
 
-    if (existingQuota == 0) {
+    bool quotaNeedsWrite = (existingQuota == 0) ||
+                           (existingQuota > kMaxPlausibleQuotaBytes) || !existingValid;
+    bool filesNeedsWrite = (existingFiles == 0) ||
+                           (existingFiles > kMaxPlausibleMaxFiles) || !existingValid;
+
+    if (quotaNeedsWrite) {
         void* quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
         if (quotaKv) {
             uint32_t lo = static_cast<uint32_t>(quotaBytes & 0xFFFFFFFFu);
@@ -834,7 +905,7 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
             wroteQuota = true;
         }
     }
-    if (existingFiles == 0) {
+    if (filesNeedsWrite) {
         void* filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
         if (filesKv) {
             g_r.kvSetInt32(filesKv, static_cast<int32_t>(maxNumFiles));
@@ -854,6 +925,38 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
             (unsigned long long)existingQuota, (unsigned long long)existingFiles);
     }
     return true;
+}
+
+// Idempotently SET (not multiply) the live ufs quota/maxnumfiles to the given
+// values, capped to plausible maxima. Used by the mixed-root rule-multiplier
+// guard. Safe to call repeatedly with the same target.
+bool SetAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
+    if (!g_ready.load(std::memory_order_acquire)) return false;
+    if (quotaBytes == 0 || maxNumFiles == 0) return false;
+
+    void* cache = GetCachePtr();
+    if (!cache) return false;
+    void* appInfo = ResolveAppInfo(cache, appId);
+    if (!appInfo) return false;
+    void* ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs) return false;
+
+    uint64_t newQuota = quotaBytes;
+    uint64_t newFiles = maxNumFiles;
+    if (newQuota > kMaxPlausibleQuotaBytes) newQuota = kMaxPlausibleQuotaBytes;
+    if (newFiles > kMaxPlausibleMaxFiles)   newFiles = kMaxPlausibleMaxFiles;
+
+    bool ok = false;
+    void* filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
+    if (filesKv) { g_r.kvSetInt32(filesKv, static_cast<int32_t>(newFiles)); ok = true; }
+    void* quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
+    if (quotaKv) {
+        g_r.kvSetUint64(quotaKv,
+                        static_cast<uint32_t>(newQuota & 0xFFFFFFFFu),
+                        static_cast<uint32_t>((newQuota >> 32) & 0xFFFFFFFFu));
+        ok = true;
+    }
+    return ok;
 }
 
 bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {

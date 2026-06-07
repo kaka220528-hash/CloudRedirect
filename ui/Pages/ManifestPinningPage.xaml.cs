@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -23,12 +24,29 @@ public partial class ManifestPinningPage : Page
     public ManifestPinningPage()
     {
         InitializeComponent();
+
+        // Apply the toggle state synchronously, before first render, so the
+        // switches never paint Off and then snap to their real state. The pin
+        // config is a tiny file behind a cached Steam path, so this is cheap.
+        _loading = true;
+        try
+        {
+            var (mp, ac, pinned) = ReadPinConfig();
+            ManifestPinningToggle.IsChecked = mp;
+            AutoCommentToggle.IsChecked = ac;
+            _pinnedApps.Clear();
+            foreach (var id in pinned)
+                _pinnedApps.Add(id);
+        }
+        catch { }
+        finally { _loading = false; }
+
         Loaded += async (_, _) =>
         {
             _loading = true;
             try
             {
-                await LoadInitialDataAsync();
+                await LoadAppListAsync();
                 await ResolveAppNamesAsync();
             }
             finally
@@ -38,39 +56,16 @@ public partial class ManifestPinningPage : Page
         };
     }
 
-    /// <summary>
-    /// Snapshot gathered off the UI thread so Loaded never blocks on
-    /// JsonDocument.Parse(pin config) or the lua dir walk.
-    /// </summary>
-    private sealed record InitialDataSnapshot(
-        bool ManifestPinning,
-        bool AutoComment,
-        HashSet<uint> PinnedApps,
-        List<LuaApp> Apps);
-
-    // M17: Move pin-config read + lua dir scan off the UI thread.
-    // Loaded used to call LoadConfig + ScanLuaFiles synchronously,
-    // which can stall if the Steam dir is on a network drive or AV
-    // is scanning *.lua. Gather everything in Task.Run and only
-    // mutate controls / collections in the dispatcher continuation.
-    private async Task LoadInitialDataAsync()
+    // M17: Move the lua dir scan off the UI thread. The walk can stall if the
+    // Steam dir is on a network drive or AV is scanning *.lua, so do it in
+    // Task.Run and only mutate collections / controls back on the dispatcher.
+    // (Toggle state is applied synchronously in the ctor before first render.)
+    private async Task LoadAppListAsync()
     {
-        var snapshot = await Task.Run(() =>
-        {
-            var (mp, ac, pinned) = ReadPinConfig();
-            var apps = ScanLuaFilesOffThread();
-            return new InitialDataSnapshot(mp, ac, pinned, apps);
-        });
-
-        ManifestPinningToggle.IsChecked = snapshot.ManifestPinning;
-        AutoCommentToggle.IsChecked = snapshot.AutoComment;
-
-        _pinnedApps.Clear();
-        foreach (var id in snapshot.PinnedApps)
-            _pinnedApps.Add(id);
+        var apps = await Task.Run(ScanLuaFilesOffThread);
 
         _apps.Clear();
-        _apps.AddRange(snapshot.Apps);
+        _apps.AddRange(apps);
 
         ApplyPinnedState();
         RefreshList();
@@ -182,19 +177,35 @@ public partial class ManifestPinningPage : Page
             app.IsPinned = _pinnedApps.Contains(app.AppId);
     }
 
+    private System.Windows.Data.ListCollectionView? _appsView;
+
     private void RefreshList()
     {
-        var query = SearchBox?.Text?.Trim() ?? "";
-        var filtered = string.IsNullOrEmpty(query)
-            ? _apps.ToList()
-            : _apps.Where(a =>
-                a.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                a.AppId.ToString().Contains(query, StringComparison.OrdinalIgnoreCase))
-              .ToList();
+        // Use a CollectionView with a live filter so search / expand toggles
+        // refresh the existing virtualized containers instead of tearing down
+        // and rebuilding every card (which re-decodes every header image).
+        if (_appsView == null)
+        {
+            _appsView = (System.Windows.Data.ListCollectionView)
+                System.Windows.Data.CollectionViewSource.GetDefaultView(_apps);
+            _appsView.Filter = AppFilter;
+            AppList.ItemsSource = _appsView;
+        }
+        else
+        {
+            _appsView.Refresh();
+        }
 
         NoPinsText.Visibility = _apps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        AppList.ItemsSource = null;
-        AppList.ItemsSource = filtered;
+    }
+
+    private bool AppFilter(object item)
+    {
+        var query = SearchBox?.Text?.Trim() ?? "";
+        if (string.IsNullOrEmpty(query)) return true;
+        if (item is not LuaApp a) return false;
+        return a.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || a.AppId.ToString().Contains(query, StringComparison.OrdinalIgnoreCase);
     }
 
     private async System.Threading.Tasks.Task ResolveAppNamesAsync()
@@ -297,8 +308,7 @@ public partial class ManifestPinningPage : Page
     private void ExpandCollapse_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { Tag: LuaApp app }) return;
-        app.IsExpanded = !app.IsExpanded;
-        RefreshList();
+        app.IsExpanded = !app.IsExpanded;  // INPC updates the card in place
     }
 
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -375,13 +385,33 @@ public partial class ManifestPinningPage : Page
         FileUtils.AtomicWriteAllText(path, json);
     }
 
-    internal class LuaApp
+    internal class LuaApp : INotifyPropertyChanged
     {
         public uint AppId { get; set; }
-        public string Name { get; set; } = "";
-        public string? HeaderUrl { get; set; }
+
+        private string _name = "";
+        public string Name
+        {
+            get => _name;
+            set { _name = value; Notify(nameof(Name)); Notify(nameof(DisplayName)); }
+        }
+
+        private string? _headerUrl;
+        public string? HeaderUrl
+        {
+            get => _headerUrl;
+            set { _headerUrl = value; Notify(nameof(HeaderUrl)); }
+        }
+
         public bool IsPinned { get; set; }
-        public bool IsExpanded { get; set; }
+
+        private bool _isExpanded;
+        public bool IsExpanded
+        {
+            get => _isExpanded;
+            set { _isExpanded = value; Notify(nameof(IsExpanded)); Notify(nameof(ChevronSymbol)); Notify(nameof(DepotsVisibility)); }
+        }
+
         public List<DepotEntry> Depots { get; set; } = new();
 
         public string DisplayName
@@ -398,6 +428,9 @@ public partial class ManifestPinningPage : Page
 
         public Visibility DepotsVisibility =>
             IsExpanded ? Visibility.Visible : Visibility.Collapsed;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        private void Notify(string n) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
     }
 
     internal class DepotEntry

@@ -65,4 +65,16 @@
     </EmbeddedResource>
   </ItemGroup>
 
+  <!-- 32-bit Steam Cloud manager tool + its steam_api.dll, EMBEDDED into the
+       single-file exe so we ship one file only. They are extracted side by side
+       to a temp dir on demand (see EmbeddedCloud760) and the 64-bit UI spawns the
+       32-bit tool from there. This is the same steam_api.dll that
+       SteamCloudFileManagerLite ships. -->
+  <ItemGroup>
+    <None Remove="native\cloud760_tool.exe" />
+    <None Remove="native\steam_api.dll" />
+    <EmbeddedResource Include="native\cloud760_tool.exe" LogicalName="cloud760_tool.exe" />
+    <EmbeddedResource Include="native\steam_api.dll" LogicalName="steam_api.dll" />
+  </ItemGroup>
+
 </Project>

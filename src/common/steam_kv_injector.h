@@ -24,6 +24,10 @@ bool TriggerPicsAndWait(uint32_t appId,
 // Write quota/maxnumfiles into KV. Won't clobber existing non-zero values.
 bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles);
 
+// Idempotently SET the live ufs quota/maxnumfiles (capped to plausible maxima).
+// Used by the mixed-root rule-multiplier guard; safe to call repeatedly.
+bool SetAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles);
+
 // A single AutoCloud save-file rule for KV injection.
 struct SaveFileRule {
     std::string root;       // e.g. "WinAppDataLocal"

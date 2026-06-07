@@ -66,7 +66,7 @@ struct BlobIndex {
 static std::unordered_map<uint64_t, BlobIndex> g_blobIndex; // key = (accountId<<32)|appId
 
 // Serializes token persistence (root_token.dat, file_tokens.dat) across
-// concurrent callers (rpc_handlers batch operations, AutoCloudBootstrap).
+// concurrent callers (rpc_handlers batch operations).
 // Per-(account,app) sync mutex registry (Steam-parity). Non-reentrant: SyncFromCloudInner-reachable callers go direct.
 static std::mutex                                              g_syncMutexRegistryMutex;
 static std::unordered_map<uint64_t, std::shared_ptr<std::mutex>> g_syncMutexRegistry;

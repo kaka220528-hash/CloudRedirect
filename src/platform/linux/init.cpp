@@ -463,8 +463,7 @@ static void OnUnload()
         }
     }
 
-    // Write final sync icon states to registry.vdf (last-write-wins after
-    // Steam's PosixRegistryManager has done its final in-memory flush).
+    // No-op (sync-icon state writer was never wired up); kept for contract.
     CloudIntercept::FlushPendingSyncStates();
 
     // Shut down cloud storage (signals workers, drains queue with timeout)

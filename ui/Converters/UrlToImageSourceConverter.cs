@@ -86,11 +86,22 @@ public sealed class UrlToImageSourceConverter : IValueConverter
         {
             var bitmap = new BitmapImage();
             bitmap.BeginInit();
+
+            // Decode to roughly display size instead of full resolution. App header
+            // art is ~460x215 on the CDN but shown at 92x43; decoding the full image
+            // for every card is the main source of list stutter. ConverterParameter
+            // overrides the target width; default 184 (2x the 92px slot for crispness
+            // on high-DPI). Only applied to file:// (fully-decoded) images.
+            int decodeWidth = 184;
+            if (parameter is string ps && int.TryParse(ps, out var pw) && pw > 0)
+                decodeWidth = pw;
+
             if (uri.IsFile)
             {
                 // Local cache file: decode now, release the handle, freeze so
                 // eviction + atomic File.Move(overwrite: true) aren't blocked.
                 bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.DecodePixelWidth = decodeWidth;
             }
             // HTTP: leave CacheOption at Default so the download streams in
             // the background. Intentionally NOT frozen -- an unfinished

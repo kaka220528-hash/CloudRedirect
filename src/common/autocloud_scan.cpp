@@ -46,7 +46,6 @@ using AutoCloudUtil::IsSafeRelativePath;
 using AutoCloudUtil::IsLinuxOS;
 using AutoCloudUtil::kMaxAppInfoBytes;
 using AutoCloudUtil::kMaxAppInfoStrings;
-using AutoCloudUtil::kMaxAutoCloudCandidateBytes;
 using AutoCloudUtil::kMaxAutoCloudScanFiles;
 using AutoCloudUtil::kMaxAutoCloudScanMillis;
 using AutoCloudUtil::NormalizeSlashes;
@@ -577,23 +576,27 @@ static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& st
 
 // SHA1 for files
 
-// Whole-file SHA1; bounded by kMaxAutoCloudCandidateBytes.
-static std::vector<uint8_t> SHA1File(const std::string& path) {
+// Read a whole file and SHA1 it in one pass, returning the bytes in outBytes so
+// the caller can reuse them without a second read. Returns empty on error.
+static std::vector<uint8_t> ReadAndHashFile(const std::string& path,
+                                            std::vector<uint8_t>& outBytes) {
+    outBytes.clear();
     std::ifstream f(FileUtil::Utf8ToPath(path), std::ios::binary);
     if (!f) return {};
 
-    // Read entire file and hash it
     f.seekg(0, std::ios::end);
     auto size = f.tellg();
-    if (size < 0 || static_cast<uint64_t>(size) > kMaxAutoCloudCandidateBytes) {
+    if (size < 0) {
         return {};
     }
     f.seekg(0);
     std::vector<uint8_t> buf(static_cast<size_t>(size));
-    if (!f.read(reinterpret_cast<char*>(buf.data()), size)) {
+    if (!buf.empty() && !f.read(reinterpret_cast<char*>(buf.data()), size)) {
         return {};  // Empty vector signals error
     }
-    return FileUtil::SHA1(buf.data(), buf.size());
+    auto sha = FileUtil::SHA1(buf.data(), buf.size());
+    outBytes = std::move(buf);
+    return sha;
 }
 
 } // anonymous namespace
@@ -632,6 +635,11 @@ ScanResult GetFileList(const std::string& steamPath,
     std::filesystem::path appUserdataDir = FileUtil::Utf8ToPath(steamPath) / "userdata" /
         std::to_string(accountId) / std::to_string(appId);
 
+    // Retain hashed bytes so the bootstrap commit can avoid re-reading; bounded
+    // by a total budget, beyond which the commit re-reads from disk.
+    constexpr uint64_t kMaxRetainedContentBytes = 512ULL * 1024 * 1024;
+    uint64_t retainedContentBytes = 0;
+
     auto addFile = [&](const std::filesystem::directory_entry& fileEntry,
                        const std::string& cloudPath,
                        const std::string& sourcePath,
@@ -643,13 +651,9 @@ ScanResult GetFileList(const std::string& steamPath,
         std::error_code ec;
         uint64_t rawSize = (uint64_t)fileEntry.file_size(ec);
         if (ec) return;
-        if (rawSize > kMaxAutoCloudCandidateBytes) {
-            LOG("GetAutoCloudFileList: skipping oversized app %u candidate %s (%llu bytes)",
-                appId, sourcePath.c_str(), (unsigned long long)rawSize);
-            return;
-        }
 
-        auto sha = SHA1File(FileUtil::PathToUtf8(fileEntry.path()));
+        std::vector<uint8_t> bytes;
+        auto sha = ReadAndHashFile(FileUtil::PathToUtf8(fileEntry.path()), bytes);
         if (sha.empty()) {
             LOG("GetAutoCloudFileList: skipping app %u file %s (SHA1 read error)",
                 appId, sourcePath.c_str());
@@ -667,6 +671,10 @@ ScanResult GetFileList(const std::string& steamPath,
         fe.rootToken = rootToken;
         fe.rootId = rootId;
         fe.sha = std::move(sha);
+        if (retainedContentBytes + bytes.size() <= kMaxRetainedContentBytes) {
+            retainedContentBytes += bytes.size();
+            fe.content = std::move(bytes);
+        }
         outResult.files.push_back(std::move(fe));
     };
 
@@ -1385,5 +1393,12 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
 std::string GetAppName(const std::string& steamPath, uint32_t appId) {
     return GetAppNameFromAppInfo(steamPath, appId);
 }
+
+#ifdef CLOUDREDIRECT_TESTING
+std::vector<uint8_t> TestReadAndHashFile(const std::string& path,
+                                         std::vector<uint8_t>& outBytes) {
+    return ReadAndHashFile(path, outBytes);
+}
+#endif
 
 } // namespace AutoCloudScan

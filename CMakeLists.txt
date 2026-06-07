@@ -64,7 +64,6 @@ set(COMMON_SOURCES
     src/common/cli.cpp
     src/common/cloud_provider_base.cpp
     src/common/autocloud_scan.cpp
-    src/common/autocloud_bootstrap.cpp
     src/common/steam_kv_injector.cpp
     src/common/parental_bypass.cpp
     src/common/metadata_sync.cpp
@@ -144,6 +143,13 @@ if(WIN32)
     target_link_libraries(cloud_redirect_cli PRIVATE Shell32 Ole32)
     # Ensure DLL is built before CLI
     add_dependencies(cloud_redirect_cli cloud_redirect)
+
+    # Standalone Steam Cloud file manager for a single AppID (default 760).
+    # Self-contained: resolves the steam_api64.dll flat exports at runtime, so it
+    # needs no Steamworks SDK headers/libs. steam_api64.dll must sit next to it.
+    add_executable(cloud760_tool
+        src/platform/win/cloud760_tool.cpp
+    )
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)
     target_link_libraries(cloud_redirect PRIVATE dl pthread)
