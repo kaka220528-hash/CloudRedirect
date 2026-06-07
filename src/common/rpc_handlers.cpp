@@ -223,65 +223,71 @@ void FlushPendingSyncStates() {}
 static constexpr uint64_t kFallbackQuotaBytes = 1073741824ULL; // 1 GB
 static constexpr uint32_t kFallbackMaxFiles   = 10000;
 
-// Cache each app's ORIGINAL (dev/PICS) ufs quota the first time we observe it,
-// before any rule-multiplier scaling, so the scaling stays idempotent across the
-// many EnsureAppQuotaInjected calls per session (otherwise re-reading the live
-// KV would compound the multiplier each call).
-struct OriginalQuota { uint64_t quotaBytes; uint32_t maxNumFiles; };
-static std::unordered_map<uint32_t, OriginalQuota> g_originalQuota;
-static std::mutex g_originalQuotaMutex;
-
-// Resolve the dev's original ufs quota for an app. On first sight, seeds the
-// cache from the live KV (which has not yet been scaled this session). Returns
-// the cached original via in/out params.
-static void GetOriginalQuota(uint32_t appId, uint64_t& quotaBytes,
-                             uint32_t& maxNumFiles) {
-    std::lock_guard<std::mutex> lock(g_originalQuotaMutex);
-    auto it = g_originalQuota.find(appId);
-    if (it == g_originalQuota.end()) {
-        g_originalQuota[appId] = OriginalQuota{quotaBytes, maxNumFiles};
-        return;
-    }
-    quotaBytes  = it->second.quotaBytes;
-    maxNumFiles = it->second.maxNumFiles;
-}
-
-// When an app has >1 savefiles rule, Steam's AC-exit disk walk counts each file
-// once per rule. Scale the live ufs budget by the rule count so colliding rules
-// (rootoverrides resolving to the same path) can't trip a false "over quota"
-// that deletes all cloud files. Idempotent: derives from the cached original.
-static void EnsureQuotaSurvivesRuleMultiplier(uint32_t appId,
+// Steam's AC-exit disk walk (CAutoCloudManager::YldOnAppExit) counts each save
+// file once PER RULE that matches it -- the native per-rule dedup is dead on the
+// exit path (sub_1384D1DA0 @ 0x1384d221a is seeded with a null "previous path"
+// there; it is only live on the staging/save path). So when two effective-platform
+// rules resolve to the SAME physical directory (via rootoverrides), every file
+// there is counted twice against maxnumfiles, tripping a false "over quota" that
+// deletes all cloud files (e.g. app 1583520: 5 files x 2 colliding rules = 10 >
+// maxnumfiles=5 -> wipe).
+//
+// We size the live maxnumfiles to the EXACT instance count that exit walk charges,
+// computed by GetFileList (ScanResult.countedInstances) which mirrors the native
+// per-rule, pre-dedup counting -- including siblings and macOS/Linux-only rules
+// that simply never resolve to a dir on this OS and therefore add nothing. Unlike
+// the old fileCount*ruleCount estimate this is collision-aware: an app whose rules
+// resolve to DISTINCT paths reports maxCollisionFactor==1 and we no-op (no wipe
+// risk), and an app with partial collisions (e.g. 3 rules, 2 colliding) gets x2,
+// not x3.
+//
+// All inputs are immutable on-disk facts we never write, so the target can NEVER
+// compound across sessions (a prior fix scaled the LIVE maxnumfiles and read its
+// own previous bump back, running away 5->31->109->343). We only RAISE the budget.
+static void EnsureQuotaSurvivesRuleMultiplier(uint32_t accountId, uint32_t appId,
                                               uint64_t liveQuota,
                                               uint32_t liveFiles) {
     std::string steamPath = CloudIntercept::GetSteamPath();
     if (steamPath.empty()) return;
-    size_t ruleCount = 0;
+
+    AutoCloudScan::ScanResult scan;
     try {
-        ruleCount = AutoCloudScan::GetRules(steamPath, appId).size();
+        scan = AutoCloudScan::GetFileList(steamPath, accountId, appId);
     } catch (...) { return; }
-    if (ruleCount <= 1) return; // single rule -> no per-rule double-count
 
-    uint64_t origQuota = liveQuota;
-    uint32_t origFiles = liveFiles;
-    GetOriginalQuota(appId, origQuota, origFiles);
+    // A collision factor <= 1 means every effective rule resolves to a distinct
+    // physical directory: the native exit walk counts each file once, exactly like
+    // the dedup-protected staging path, so there is no over-quota risk to cover.
+    if (scan.maxCollisionFactor <= 1) return;
+    if (scan.countedInstances == 0) return;
 
-    // Effective budget must cover original_per_file_budget * ruleCount instances,
-    // PLUS headroom: Steam's YldOnAppExit budget loop also subtracts apireserve*
-    // and decrements the file budget by (1 + siblingCount) per file, so an exact
-    // fileCount*ruleCount budget still trips. Add a full extra rule-multiple of
-    // slack so the colliding duplicates never reach the cutoff.
-    uint64_t targetFiles = static_cast<uint64_t>(origFiles) * (ruleCount + 1) + 16;
-    uint64_t targetQuota = origQuota * (ruleCount + 1);
-    if (targetFiles <= liveFiles && targetQuota <= liveQuota) {
-        return; // already sufficient (idempotent no-op)
-    }
-    SteamKvInjector::SetAppQuota(appId, targetQuota,
-                                 static_cast<uint32_t>(targetFiles));
-    LOG("[NS] EnsureQuotaSurvivesRuleMultiplier app=%u: %zu rules -> set budget "
-        "files=%u->%llu quota=%llu->%llu (original files=%u quota=%llu)",
-        appId, ruleCount, liveFiles, (unsigned long long)targetFiles,
-        (unsigned long long)liveQuota, (unsigned long long)targetQuota,
-        origFiles, (unsigned long long)origQuota);
+    // neededFiles = exact instances the exit walk charges + derived slack. The
+    // slack replaces the old magic +16: YldOnAppExit's loop also consumes
+    // (1 + siblingCount) budget per colliding rule pass, captured per worst dir as
+    // collisionSiblingHeadroom. Keep a small floor so we are never under by 1-2.
+    size_t derivedHeadroom = scan.collisionSiblingHeadroom;
+    if (derivedHeadroom < scan.maxCollisionFactor) derivedHeadroom = scan.maxCollisionFactor;
+    uint64_t needed = static_cast<uint64_t>(scan.countedInstances) + derivedHeadroom;
+
+    // Guard against pathological inputs producing an implausible budget.
+    constexpr uint64_t kMaxPlausibleFiles = 1000000ULL;
+    if (needed > kMaxPlausibleFiles) needed = kMaxPlausibleFiles;
+    uint32_t neededFiles = static_cast<uint32_t>(needed);
+    if (neededFiles <= liveFiles) return; // current budget already covers it
+
+    // Raise quota bytes proportionally too (rough: keep per-file budget constant).
+    uint64_t neededQuota = liveFiles > 0
+        ? liveQuota * neededFiles / liveFiles
+        : liveQuota;
+    if (neededQuota < liveQuota) neededQuota = liveQuota;
+
+    SteamKvInjector::SetAppQuota(appId, neededQuota, neededFiles);
+    LOG("[NS] EnsureQuotaSurvivesRuleMultiplier app=%u: %zu unique files, "
+        "%zu counted instances x%zu collision (+%zu headroom) -> "
+        "raise maxnumfiles %u->%u quota %llu->%llu",
+        appId, scan.files.size(), scan.countedInstances, scan.maxCollisionFactor,
+        derivedHeadroom, liveFiles, neededFiles,
+        (unsigned long long)liveQuota, (unsigned long long)neededQuota);
 }
 
 static bool EnsureAppQuotaInjected(uint32_t accountId, uint32_t appId,
@@ -296,35 +302,20 @@ static bool EnsureAppQuotaInjected(uint32_t accountId, uint32_t appId,
     bool readOk = SteamKvInjector::ReadAppQuota(appId, existingQuota, existingFiles);
 
         if (readOk && existingQuota > 0 && existingFiles > 0) {
-        // The live KV may already carry our rule-multiplier scaling from an
-        // earlier call this session. Resolve the dev's ORIGINAL value (cached on
-        // first sight) so we never cache/propagate a scaled budget.
-        uint64_t origQuota = existingQuota;
-        uint32_t origFiles = existingFiles;
-        GetOriginalQuota(appId, origQuota, origFiles);
-
         if (cloudState &&
-            (cloudState->quota.quotaBytes != origQuota ||
-             cloudState->quota.maxNumFiles != origFiles)) {
-            cloudState->quota.quotaBytes = origQuota;
-            cloudState->quota.maxNumFiles = origFiles;
+            (cloudState->quota.quotaBytes != existingQuota ||
+             cloudState->quota.maxNumFiles != existingFiles)) {
+            cloudState->quota.quotaBytes = existingQuota;
+            cloudState->quota.maxNumFiles = existingFiles;
             cloudState->quota.fetchedAtUnix = static_cast<uint64_t>(time(nullptr));
             cloudState->quota.lastSeenBuildId = cloudState->appBuildId;
             LOG("[NS] EnsureAppQuotaInjected app=%u: caching PICS quota=%llu files=%u (publish deferred to next batch)",
-                appId, (unsigned long long)origQuota, origFiles);
+                appId, (unsigned long long)existingQuota, existingFiles);
             // Quota persisted on next CompleteBatch; async publish risks overwriting newer state.
         }
         LOG("[NS] EnsureAppQuotaInjected app=%u: Steam has quota=%llu files=%u",
             appId, (unsigned long long)existingQuota, existingFiles);
-        // Mixed-root collision guard: when an app has >1 savefiles rule, Steam's
-        // exit disk-walk counts each file once PER RULE. Apps whose rules resolve
-        // to the same path on this OS (via rootoverrides) get fileCount*ruleCount
-        // instances counted against maxnumfiles -> spurious "over quota" eviction
-        // that DELETES all cloud files (e.g. app 1583520: 2 rules, maxnumfiles=5,
-        // 5 files -> 10 instances > 5 -> wipe). Scale the live budget by the rule
-        // count so the dev's effective per-file budget is preserved. Idempotent:
-        // computed from the cached ORIGINAL value, then set (not multiplied).
-        EnsureQuotaSurvivesRuleMultiplier(appId, existingQuota, existingFiles);
+        EnsureQuotaSurvivesRuleMultiplier(accountId, appId, existingQuota, existingFiles);
         return true;
     }
 
