@@ -29,6 +29,8 @@ static CloudPushFn g_cloudPush;
 
 // Resolves the current Steam accountId for locating native UserGameStats blobs.
 static AccountIdProvider g_accountIdProvider;
+// Fired when an import finds no schema for an app (platform requests it).
+static SchemaMissingCallback g_schemaMissingCb;
 
 void SetCloudProvider(CloudPullFn pull, CloudPushFn push) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -39,6 +41,11 @@ void SetCloudProvider(CloudPullFn pull, CloudPushFn push) {
 void SetAccountIdProvider(AccountIdProvider provider) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_accountIdProvider = std::move(provider);
+}
+
+void SetSchemaMissingCallback(SchemaMissingCallback cb) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_schemaMissingCb = std::move(cb);
 }
 
 // ── Native UserGameStats (BKV) reader ────────────────────────────────────
@@ -152,6 +159,68 @@ uint32_t BkvDataAsU32(const BkvNode& dataNode) {
         case BKV_FLOAT: { uint32_t v; std::memcpy(&v, &dataNode.floatVal, 4); return v; }
         default:         return 0;
     }
+}
+
+// Build a (statId,bit) -> human-readable achievement name map from the parsed
+// schema BKV tree. Schema shape:
+//   <appId> (SECTION)
+//     stats (SECTION)
+//       <statId> (SECTION)
+//         bits (SECTION)
+//           <bit> (SECTION)
+//             name "ACHIEVEMENT_x"            (api name, fallback)
+//             display (SECTION) > name (SECTION) > english "Human Name"
+// Prefers the English display name; falls back to the api name.
+std::unordered_map<uint64_t, std::string>
+ParseSchemaAchievementNames(const std::vector<BkvNode>& schemaRoot) {
+    std::unordered_map<uint64_t, std::string> names;
+
+    // Root is a single <appId> section; descend to "stats".
+    const BkvNode* statsSec = nullptr;
+    for (const auto& top : schemaRoot) {
+        if (top.type != BKV_SECTION) continue;
+        if (auto* s = BkvFind(top.children, "stats")) { statsSec = s; break; }
+        if (top.name == "stats") { statsSec = &top; break; }
+    }
+    if (!statsSec) return names;
+
+    for (const auto& stat : statsSec->children) {
+        if (stat.type != BKV_SECTION) continue;
+        bool numeric = !stat.name.empty();
+        for (char c : stat.name) { if (c < '0' || c > '9') { numeric = false; break; } }
+        if (!numeric) continue;
+        uint32_t statId = (uint32_t)strtoul(stat.name.c_str(), nullptr, 10);
+
+        const BkvNode* bits = BkvFind(stat.children, "bits");
+        if (!bits) continue;
+
+        for (const auto& bitSec : bits->children) {
+            if (bitSec.type != BKV_SECTION) continue;
+            bool bnum = !bitSec.name.empty();
+            for (char c : bitSec.name) { if (c < '0' || c > '9') { bnum = false; break; } }
+            if (!bnum) continue;
+            uint32_t bit = (uint32_t)strtoul(bitSec.name.c_str(), nullptr, 10);
+            if (bit >= 32) continue;
+
+            std::string display;
+            if (const BkvNode* disp = BkvFind(bitSec.children, "display")) {
+                if (const BkvNode* nameSec = BkvFind(disp->children, "name")) {
+                    if (const BkvNode* eng = BkvFind(nameSec->children, "english"))
+                        display = eng->strVal;
+                    // Fall back to the first localized string if no english.
+                    if (display.empty() && !nameSec->children.empty())
+                        display = nameSec->children.front().strVal;
+                }
+            }
+            if (display.empty()) {
+                if (const BkvNode* apiName = BkvFind(bitSec.children, "name"))
+                    display = apiName->strVal;
+            }
+            if (!display.empty())
+                names[((uint64_t)statId << 32) | bit] = display;
+        }
+    }
+    return names;
 }
 
 } // namespace
@@ -320,6 +389,10 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
             out.schema.assign(std::istreambuf_iterator<char>(sf),
                               std::istreambuf_iterator<char>());
         }
+        // No schema on disk -> ask the platform to fetch it from Steam's server
+        // (so achievement names become available on the next import).
+        if (out.schema.empty() && g_schemaMissingCb)
+            g_schemaMissingCb(appId);
     }
 
     // Stats: appcache\stats\UserGameStats_<accountId>_<appId>.bin
@@ -341,6 +414,15 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
 
     const BkvNode* cache = BkvFind(root, "cache");
     if (!cache) return false;
+
+    // Parse the schema (if present) for human-readable achievement names.
+    std::unordered_map<uint64_t, std::string> achNames;
+    if (!out.schema.empty()) {
+        size_t spos = 0, snodes = 0;
+        std::vector<BkvNode> sroot;
+        if (BkvRead(out.schema.data(), out.schema.size(), spos, sroot, 0, snodes))
+            achNames = ParseSchemaAchievementNames(sroot);
+    }
 
     size_t importedStats = 0, importedAch = 0;
     for (const auto& stat : cache->children) {
@@ -370,6 +452,14 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
                 if (bitNode.type != BKV_INT) continue;
                 uint32_t bit = (uint32_t)strtoul(bitNode.name.c_str(), nullptr, 10);
                 if (bit < 32) blk.unlockTimes[bit] = bitNode.intVal;
+            }
+            // Attach human-readable names from the schema (for all 32 bits that
+            // have one, not just unlocked -- the UI may show locked ones too).
+            if (!achNames.empty()) {
+                for (uint32_t bit = 0; bit < 32; bit++) {
+                    auto it = achNames.find(((uint64_t)statId << 32) | bit);
+                    if (it != achNames.end()) blk.names[bit] = it->second;
+                }
             }
             out.achievements.push_back(blk);
             ++importedAch;
@@ -416,6 +506,11 @@ static bool ParseAppStatsJson(const std::string& content, AppStats& out) {
                     blk.unlockTimes[j] = (uint32_t)times[j].integer();
                 }
             }
+            const auto& names = item["names"];
+            if (names.type == Json::Type::Array) {
+                for (size_t j = 0; j < names.size() && j < 32; j++)
+                    blk.names[j] = names[j].str();
+            }
             out.achievements.push_back(blk);
         }
     }
@@ -457,6 +552,15 @@ static std::string BuildAppStatsJson(const AppStats& stats) {
             times.arrVal.push_back(Json::Number(a.unlockTimes[i]));
         }
         item.objVal["unlock_times"] = std::move(times);
+        // Human-readable per-bit names from the schema (may be empty strings).
+        bool anyName = false;
+        for (int i = 0; i < 32; i++) if (!a.names[i].empty()) { anyName = true; break; }
+        if (anyName) {
+            Json::Value namesArr = Json::Array();
+            for (int i = 0; i < 32; i++)
+                namesArr.arrVal.push_back(Json::String(a.names[i]));
+            item.objVal["names"] = std::move(namesArr);
+        }
         achArr.arrVal.push_back(std::move(item));
     }
     root.objVal["achievements"] = std::move(achArr);
@@ -709,6 +813,10 @@ void StartSession(uint32_t appId) {
     if (stats.playtime.lastPlayedTime == 0) {
         LoadAppStats(appId, stats);
     }
+    // Seed achievements/stats from Steam's native blob too -- not every app gets
+    // a GetUserStats RPC, so launching the game is our reliable trigger to import
+    // (and then cloud-sync) the real stat/achievement data, not just playtime.
+    EnsureNativeImportLocked(appId, stats);
     stats.playtime.lastPlayedTime = NowUnix();
     g_dirty[appId] = true;
     LOG("[Stats] Session started for app %u", appId);

@@ -31,6 +31,7 @@ struct AchievementBlock {
     uint32_t statId;    // the achievement stat ID (type 4)
     uint32_t bits;      // bitmask of unlocked achievements
     uint32_t unlockTimes[32]; // per-bit unlock timestamps
+    std::string names[32];    // per-bit human-readable display name (from schema)
 };
 
 struct PlaytimeData {
@@ -60,6 +61,12 @@ void Init(const std::string& storageRoot, const std::string& steamPath);
 // Returns 0 if not yet known (e.g. not logged in). Resolved lazily on access.
 using AccountIdProvider = std::function<uint32_t()>;
 void SetAccountIdProvider(AccountIdProvider provider);
+
+// Install a callback invoked when a native import finds NO achievement schema
+// for an app (UserGameStatsSchema_<appId>.bin missing). The platform layer uses
+// this to request the schema from Steam's server. Fire-and-forget.
+using SchemaMissingCallback = std::function<void(uint32_t appId)>;
+void SetSchemaMissingCallback(SchemaMissingCallback cb);
 
 // Load stats for an app. Returns true if data exists on disk.
 bool LoadAppStats(uint32_t appId, AppStats& out);

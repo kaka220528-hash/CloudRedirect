@@ -52,6 +52,7 @@ static constexpr uint32_t PROTO_FLAG = 0x80000000;
 static constexpr uint32_t EMSG_MASK = 0x7FFFFFFF;
 static constexpr uint32_t EMSG_SERVICE_METHOD = 151;
 static constexpr uint32_t EMSG_SERVICE_METHOD_RESP = 147;
+static constexpr uint32_t EMSG_CLIENT_GET_USER_STATS_RESP = 819;  // schema-fetch response
 static constexpr uint64_t JOBID_NONE = 0xFFFFFFFFFFFFFFFFULL;
 
 static constexpr uint32_t HDR_STEAMID = 1;
@@ -100,8 +101,28 @@ static constexpr size_t SC_BDD_STOLEN_BYTES = 14;  // first 14 bytes of prologue
 static constexpr uintptr_t SC_RVA_BASYNC_SEND = 0xCF0DF0;
 static constexpr size_t SC_BAS_STOLEN_BYTES = 15;   // 5+5+1+4 bytes of prologue
 // CProtoBufMsg layout offsets
+static constexpr uint32_t CPROTOBUFMSG_OFF_DESC   = 0x08;  // typed-body descriptor vtable*
+static constexpr uint32_t CPROTOBUFMSG_OFF_CONN   = 0x1C;  // uint32_t connection handle
 static constexpr uint32_t CPROTOBUFMSG_OFF_EMSG   = 0x20;  // uint32_t EMsg | PROTO_FLAG
 static constexpr uint32_t CPROTOBUFMSG_OFF_BODY   = 0x30;  // protobuf body object*
+
+// Schema-fetch injection: build a CMsgClientGetUserStats (EMsg 818) and send it
+// via BAsyncSend, asking the server for the latest achievement schema of any app
+// (schema_local_version=-1) on behalf of an owning SteamID (steam_id_for_user).
+// The server's 819 response is handled by Steam itself, which writes
+// appcache\stats\UserGameStatsSchema_<appid>.bin -- we just trigger the request.
+// (IDA-verified against steamclient64: ctor sub_138CF07F0, finalize sub_138CF3390,
+//  cleanup sub_138CF0AA0, body descriptor off_1396E4460 @ RVA 0x16E4460.)
+static constexpr uintptr_t SC_RVA_PBMSG_CTOR      = 0xCF07F0;   // CProtoBufMsgBase::ctor(this, emsg, 0)
+static constexpr uintptr_t SC_RVA_PBMSG_FINALIZE  = 0xCF3390;   // allocate typed body
+static constexpr uintptr_t SC_RVA_PBMSG_CLEANUP   = 0xCF0AA0;   // destroy msg
+static constexpr uintptr_t SC_RVA_GETUSERSTATS_DESC = 0x16E4460; // CMsgClientGetUserStats body descriptor
+// Typed vtable for CProtoBufMsg<CMsgClientGetUserStats> (??_7?$CProtoBufMsg@VCMsgClientGetUserStats@@@@6B@).
+// MUST be installed at msg[0] after the base ctor: BAsyncSend dispatches GetSize
+// (vtbl+24) and Serialize (vtbl+32) through it. Leaving the base vftable there
+// serializes the message wrong -> pipes.cpp:881 BWrite failed -> client crash.
+static constexpr uintptr_t SC_RVA_GETUSERSTATS_VFTABLE = 0x13368C8;
+static constexpr uint32_t EMSG_CLIENT_GET_USER_STATS = 818;
 
 // steamclient64.dll RVAs for CCMInterface discovery
 // IDA image base: 0x138000000
@@ -342,6 +363,35 @@ static NotificationSlot8Fn g_originalSlot8 = nullptr;       // saved original sl
 static ParseFromArrayFn g_parseFromArray = nullptr;          // sub_138BD0210
 static SerializeToArrayFn g_serializeToArray = nullptr;      // sub_138BD07E0
 static std::atomic<bool> g_vtableHookInstalled{false};
+
+// Schema-fetch injection primitives (resolved at hook install from steamclient64).
+using PbMsgCtorFn     = void*(__fastcall*)(void* self, int emsg, int unk);
+using PbMsgFinalizeFn = void(__fastcall*)(void* self);
+using PbMsgCleanupFn  = void(__fastcall*)(void* self);
+static PbMsgCtorFn     g_pbMsgCtor = nullptr;
+static PbMsgFinalizeFn g_pbMsgFinalize = nullptr;
+static PbMsgCleanupFn  g_pbMsgCleanup = nullptr;
+static void*           g_getUserStatsDesc = nullptr;   // off_1396E4460 (resolved)
+static void*           g_getUserStatsVtbl = nullptr;   // typed CProtoBufMsg vftable (resolved)
+// A live connection handle captured from a real BAsyncSend call -- reused to send
+// our injected schema requests on the same CM connection.
+static std::atomic<uint32_t> g_liveConnHandle{0};
+// The CM connection handle captured from Steam's own GetUserStats (EMsg 818) --
+// the connection that receives 819 replies. Preferred over g_liveConnHandle for
+// our injected schema requests.
+static std::atomic<uint32_t> g_statsConnHandle{0};
+// Captured from Steam's own GetUserStats header (CMsgProtoBufHeader). The CM
+// server drops any GetUserStats whose header lacks steamid + client_sessionid,
+// so we copy these from Steam's live session onto our injected requests.
+// Header field offsets (mapped from the live header object @ msg+0x28):
+//   +16  presence bitmask  (bits: 0x40 steamid, 0x80 client_sessionid,
+//                           0x8000000 jobid_source, 0x80000000 realm)
+//   +104 steamid (fixed64), +112 client_sessionid (int32),
+//   +156 realm (uint32),    +208 jobid_source (fixed64)
+static std::atomic<uint64_t> g_hdrSteamId{0};
+static std::atomic<uint32_t> g_hdrSessionId{0};
+static std::atomic<uint32_t> g_hdrRealm{0};
+static std::atomic<bool>     g_hdrCaptured{false};
 static uintptr_t g_serviceTransportVtableEa = 0;             // resolved via RTTI at install; 0 = unresolved, fall back to RVA
 
 // CClientUnifiedServiceTransport vtable slot offsets (stable interface contract).
@@ -376,6 +426,7 @@ static bool HasNamespaceApps() {
 }
 
 uint32_t GetAccountId();  // defined later
+void RequestSchemaForApp(uint32_t appId);  // defined later (schema auto-fetch)
 
 // "Mark as private" support: Steam stores per-user private appIds as a JSON array
 // under PrivateApps_<accountId> in localconfig.vdf. We honor it so the friends
@@ -744,6 +795,60 @@ static std::mutex g_injectMutex;
 static thread_local bool t_drainingInjectQueue = false;
 
 static void ProcessQueuedInjection(QueuedInjection* ctx); // defined below
+
+// ── Schema-request queue ──────────────────────────────────────────────────
+// Outbound GetUserStats schema requests MUST be sent on Steam's network thread:
+// BAsyncSend touches per-thread pipe/coroutine TLS, and calling it from an
+// arbitrary background thread corrupts steamclient pipe state (observed crash:
+// steamclient.cpp:857 "bufRet.TellPut() == sizeof(uint8)" assert in the IPC
+// release path, taking down steamwebhelper). So the sweep only ENQUEUES
+// (appId, owner) pairs; we drain a few per net-thread tick for gentle pacing.
+struct SchemaSendItem { uint32_t appId; uint64_t owner; };
+static std::queue<SchemaSendItem> g_schemaSendQueue;
+static std::mutex g_schemaSendMutex;
+static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHandle); // fwd
+
+// Compile-time kill-switch: set to 0 to completely disable proactive schema
+// fetching (leaves the rest of the DLL intact). Kept as an emergency guard.
+#define SCHEMA_FETCH_ENABLED 1
+
+// Reentrancy guard: SendSchemaRequest -> BAsyncSend sends a packet, which
+// re-enters BAsyncSendHook / OnSendPkt -> DrainSchemaQueueOnNetThread again.
+// Without this guard the drain recurses on itself before the first BAsyncSend
+// returns, blowing the stack / corrupting the pipe and crashing the client.
+static thread_local bool t_drainingSchemaQueue = false;
+
+// Drain a small batch of queued schema requests on the calling network thread.
+// Called from the recv/send hooks (which already run on the net thread).
+static void DrainSchemaQueueOnNetThread() {
+#if !SCHEMA_FETCH_ENABLED
+    return;
+#endif
+    if (!MetadataSync::schemaFetch.load(std::memory_order_relaxed)) return;
+    if (t_drainingSchemaQueue) return;          // prevent reentrancy via BAsyncSend
+    if (g_shuttingDown.load(std::memory_order_acquire)) return;
+    // Need the captured session header (steamid/sessionid) before any send, or
+    // the server drops the request.
+    if (!g_hdrCaptured.load(std::memory_order_relaxed)) return;
+    // Prefer the CM handle captured from Steam's own GetUserStats; fall back to
+    // the generic live handle only if we never observed an 818.
+    uint32_t conn = g_statsConnHandle.load(std::memory_order_relaxed);
+    if (conn == 0) conn = g_liveConnHandle.load(std::memory_order_relaxed);
+    if (conn == 0) return;
+    t_drainingSchemaQueue = true;
+    constexpr int kMaxPerTick = 2;   // gentle: a couple of sends per net tick
+    for (int i = 0; i < kMaxPerTick; ++i) {
+        SchemaSendItem item;
+        {
+            std::lock_guard<std::mutex> lock(g_schemaSendMutex);
+            if (g_schemaSendQueue.empty()) break;
+            item = g_schemaSendQueue.front();
+            g_schemaSendQueue.pop();
+        }
+        SendSchemaRequest(item.appId, item.owner, conn);
+    }
+    t_drainingSchemaQueue = false;
+}
 
 // Drain the inject queue on the calling network thread. Safe to call from OnSendPkt
 // or RecvPktMonitorHook. Caller must already be on the network thread.
@@ -1198,7 +1303,10 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
 
     // Native Player.GetUserStats#1 (per IDA, this lands on slot 4 / vtable+32).
     // Bodies here are RAW protobuf objects (no CProtoBufMsg +48 wrapper).
-    if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0) {
+    // Gated by sync_achievements: when off, do not interfere -- pass straight
+    // through to Steam's real server.
+    if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0
+        && MetadataSync::syncAchievements.load(std::memory_order_relaxed)) {
         if (requestBody && responseBody && g_serializeToArray) {
             auto reqBytes = SerializeBodyToBytes(requestBody);
             auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -1348,7 +1456,8 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     // Player.ClientGetLastPlayedTimes#1 (account-wide): let the real server reply,
     // then APPEND our namespace apps' playtime so Steam shows it. Real owned games
     // keep their server playtime (the client merges per-appid). See IDA notes.
-    if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0) {
+    if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0
+        && MetadataSync::syncAchievements.load(std::memory_order_relaxed)) {
         if (request && response) {
             void* reqBody = *(void**)((uintptr_t)request + 48);
             if (reqBody) {
@@ -1378,7 +1487,8 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    if (strcmp(methodName, StatsHandlers::RPC_GET_LAST_PLAYED) == 0) {
+    if (strcmp(methodName, StatsHandlers::RPC_GET_LAST_PLAYED) == 0
+        && MetadataSync::syncPlaytime.load(std::memory_order_relaxed)) {
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         LOG("[Stats] slot5 GetLastPlayedTimes seen: serverResult=%d", result ? 1 : 0);
         if (result && response) {
@@ -1997,6 +2107,27 @@ static void InstallServiceMethodHookLocked() {
     LOG("[VtHook] ParseFromArray=%p SerializeToArray=%p",
         g_parseFromArray, g_serializeToArray);
 
+    // Resolve schema-fetch injection primitives (best-effort; if a prologue
+    // check fails we just disable schema-fetch, leaving the rest intact).
+    {
+        auto ctor     = (PbMsgCtorFn)(g_steamClientBase + SC_RVA_PBMSG_CTOR);
+        auto finalize = (PbMsgFinalizeFn)(g_steamClientBase + SC_RVA_PBMSG_FINALIZE);
+        auto cleanup  = (PbMsgCleanupFn)(g_steamClientBase + SC_RVA_PBMSG_CLEANUP);
+        if (LooksLikeFunctionPrologue(reinterpret_cast<const uint8_t*>(ctor)) &&
+            LooksLikeFunctionPrologue(reinterpret_cast<const uint8_t*>(finalize)) &&
+            LooksLikeFunctionPrologue(reinterpret_cast<const uint8_t*>(cleanup))) {
+            g_pbMsgCtor        = ctor;
+            g_pbMsgFinalize    = finalize;
+            g_pbMsgCleanup     = cleanup;
+            g_getUserStatsDesc = (void*)(g_steamClientBase + SC_RVA_GETUSERSTATS_DESC);
+            g_getUserStatsVtbl = (void*)(g_steamClientBase + SC_RVA_GETUSERSTATS_VFTABLE);
+            LOG("[Schema] Fetch primitives resolved (ctor=%p desc=%p vtbl=%p)",
+                ctor, g_getUserStatsDesc, g_getUserStatsVtbl);
+        } else {
+            LOG("[Schema] Fetch primitives failed prologue check -- schema auto-fetch disabled");
+        }
+    }
+
     // Prefer RTTI walk (build-update-tolerant); fall back to hardcoded RVA if RTTI fails. Validate slot 0 either way.
     // Resolution stays local; cache to g_serviceTransportVtableEa only on full-install success below.
     // Reject a cached EA that doesn't belong to the current steamclient image: the
@@ -2280,6 +2411,8 @@ static __int64 __fastcall BuildDepotDependencyHook(__int64* a1, unsigned int a2,
     return result;
 }
 
+static bool TryHandleSchemaResponse(const uint8_t* data, uint32_t size);  // fwd decl
+
 // RecvPkt monitor hook (logging + Approach D injection drain)
 static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
     HookGuard guard;
@@ -2287,6 +2420,7 @@ static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
         return g_originalRecvPkt(thisptr, pkt);
     // Drain on the network-recv thread (valid Coroutine_Continue TLS).
     DrainInjectQueueOnNetThread();
+    DrainSchemaQueueOnNetThread();   // schema sends must run on the net thread
 
     if (!pkt || !pkt->pubData || pkt->cubData < 8)
         return g_originalRecvPkt(thisptr, pkt);
@@ -2294,6 +2428,12 @@ static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
     uint32_t emsgRaw;
     memcpy(&emsgRaw, pkt->pubData, 4);
     uint32_t emsg = emsgRaw & EMSG_MASK;
+
+    // Capture our injected schema-fetch responses (legacy EMsg 819).
+    if (emsg == EMSG_CLIENT_GET_USER_STATS_RESP) {
+        TryHandleSchemaResponse(pkt->pubData, pkt->cubData);
+        return g_originalRecvPkt(thisptr, pkt);   // let Steam process it too
+    }
 
     if (emsg != EMSG_SERVICE_METHOD_RESP)
         return g_originalRecvPkt(thisptr, pkt);
@@ -3833,6 +3973,19 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             if (cfg["sync_luas"].type == Json::Type::Bool)
                 MetadataSync::syncLuas = cfg["sync_luas"].boolean();
         }
+        // Native stats/playtime sync gates. Absent -> keep default (ON). When
+        // off, the matching native path does not interfere with Steam at all.
+        if (cfg["sync_achievements"].type == Json::Type::Bool)
+            MetadataSync::syncAchievements = cfg["sync_achievements"].boolean();
+        if (cfg["sync_playtime"].type == Json::Type::Bool)
+            MetadataSync::syncPlaytime = cfg["sync_playtime"].boolean();
+        // Experimental: proactive schema fetch (opt-in, default off).
+        if (cfg["experimental_schema_fetch"].type == Json::Type::Bool)
+            MetadataSync::schemaFetch = cfg["experimental_schema_fetch"].boolean();
+        LOG("[Stats] Sync gates: achievements=%d, playtime=%d, schemaFetch=%d",
+            MetadataSync::syncAchievements.load() ? 1 : 0,
+            MetadataSync::syncPlaytime.load() ? 1 : 0,
+            MetadataSync::schemaFetch.load() ? 1 : 0);
         if (!cloudSaveOnly) {
             if (cfg["parental_bypass_playtime"].type == Json::Type::Bool)
                 g_parentalBypassPlaytime = cfg["parental_bypass_playtime"].boolean();
@@ -3894,6 +4047,12 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     // Resolve current accountId lazily so the store can import Steam's native
     // UserGameStats blobs (appcache\stats\UserGameStats_<accountId>_<appId>.bin).
     StatsStore::SetAccountIdProvider([]() -> uint32_t { return GetAccountId(); });
+    // When an import finds no achievement schema, fetch it from Steam's server.
+    StatsStore::SetSchemaMissingCallback([](uint32_t appId) {
+        // Run off-thread: this is called under the store mutex during import,
+        // and the fetch sends network messages + sleeps.
+        std::thread([appId] { RequestSchemaForApp(appId); }).detach();
+    });
     StatsStore::Init(cloudRoot, g_steamPath);
     StatsHandlers::Init();
 
@@ -4075,7 +4234,68 @@ static void RewriteGamesPlayedBody(void* bodyObj) {
     ParseBytesToBody(bodyObj, newBody.data(), newBody.size());
 }
 
+static void SweepNamespaceSchemas();  // fwd decl
+
+// Schedule the proactive schema sweep ONCE, on a delay, so it runs only after
+// Steam's startup/login has settled (injecting during the startup RPC burst
+// hangs the client on the spinning logo). The delay thread waits, then calls
+// the sweep, which enqueues requests drained gently on the net thread.
+static std::atomic<bool> g_schemaSweepScheduled{false};
+static void MaybeScheduleSchemaSweep() {
+    // Experimental opt-in: only fetch schemas when the user enabled it.
+    if (!MetadataSync::schemaFetch.load(std::memory_order_relaxed)) return;
+    if (g_schemaSweepScheduled.exchange(true)) return;   // once per session
+    std::thread([] {
+        constexpr int kStartupSettleMs = 90000;          // wait for startup to finish
+        for (int waited = 0; waited < kStartupSettleMs; waited += 500) {
+            if (g_shuttingDown.load(std::memory_order_acquire)) return;
+            Sleep(500);
+        }
+        if (g_shuttingDown.load(std::memory_order_acquire)) return;
+        SweepNamespaceSchemas();
+    }).detach();
+}
+
 static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
+    // Capture a live connection handle for our injected schema-fetch requests.
+    // Do NOT kick the schema sweep here: this fires during Steam's login/startup
+    // RPC burst, and injecting our requests then stalls the client (spinning-logo
+    // hang). The sweep is started on a delay timer (see SweepNamespaceSchemas /
+    // the deferred-start thread below) once startup has settled.
+    if (connHandle && pMsg) {
+        // Capture the connection handle, preferring the one Steam itself uses for
+        // GetUserStats (EMsg 818) -- that is the CM connection that receives 819
+        // replies. A handle grabbed from an unrelated send may be a different
+        // connection, so the server's reply would not route to where we listen.
+        uint32_t hookEmsg = *(uint32_t*)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_EMSG) & EMSG_MASK;
+        if (hookEmsg == EMSG_CLIENT_GET_USER_STATS) {
+            if (g_statsConnHandle.exchange(connHandle, std::memory_order_relaxed) != connHandle)
+                LOG("[Schema] captured CM conn=%u from Steam's own GetUserStats", connHandle);
+            // Capture Steam's own header session fields (steamid, client_sessionid,
+            // realm) so we can stamp them onto our injected requests -- the CM
+            // server drops a GetUserStats whose header lacks these.
+            if (!g_hdrCaptured.load(std::memory_order_relaxed)) {
+                void* ownHdr = *(void**)((uintptr_t)pMsg + 0x28);
+                if (ownHdr) {
+                    uint8_t* hb = (uint8_t*)ownHdr;
+                    uint64_t sid = *(uint64_t*)(hb + 104);
+                    uint32_t ses = *(uint32_t*)(hb + 112);
+                    uint32_t rlm = *(uint32_t*)(hb + 156);
+                    if (sid != 0) {
+                        g_hdrSteamId.store(sid, std::memory_order_relaxed);
+                        g_hdrSessionId.store(ses, std::memory_order_relaxed);
+                        g_hdrRealm.store(rlm, std::memory_order_relaxed);
+                        g_hdrCaptured.store(true, std::memory_order_relaxed);
+                        LOG("[Schema] captured header session: steamid=0x%llX sessionid=%u realm=%u",
+                            (unsigned long long)sid, ses, rlm);
+                    }
+                }
+            }
+        }
+        // Still keep a generic fallback handle if we never see an 818.
+        g_liveConnHandle.store(connHandle, std::memory_order_relaxed);
+        MaybeScheduleSchemaSweep();
+    }
     if (HasNamespaceApps() && pMsg && g_serializeToArray && g_parseFromArray) {
         uint32_t emsgRaw = *(uint32_t*)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_EMSG);
         uint32_t emsg = emsgRaw & EMSG_MASK;
@@ -4089,11 +4309,15 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
                 // Observe games-played to track native playtime sessions, then
                 // rewrite for the non-Steam-game spoof. Observation reads only;
                 // it starts/ends StatsStore sessions by appid.
-                auto observeBytes = SerializeBodyToBytes(bodyObj);
-                if (!observeBytes.empty()) {
-                    LOG("[Stats] GamesPlayed observed (emsg=%u, %zu bytes) -> session tracking",
-                        emsg, observeBytes.size());
-                    StatsHandlers::ObserveGamesPlayed(observeBytes.data(), observeBytes.size());
+                // Playtime session tracking is gated by sync_playtime: when
+                // off, we do not observe games-played at all.
+                if (MetadataSync::syncPlaytime.load(std::memory_order_relaxed)) {
+                    auto observeBytes = SerializeBodyToBytes(bodyObj);
+                    if (!observeBytes.empty()) {
+                        LOG("[Stats] GamesPlayed observed (emsg=%u, %zu bytes) -> session tracking",
+                            emsg, observeBytes.size());
+                        StatsHandlers::ObserveGamesPlayed(observeBytes.data(), observeBytes.size());
+                    }
                 }
                 if (g_showNonSteamGame.load(std::memory_order_relaxed))
                     RewriteGamesPlayedBody(bodyObj);
@@ -4102,6 +4326,282 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
     }
 
     return g_basOriginal(pMsg, connHandle);
+}
+
+// ── Achievement-schema auto-fetch ──────────────────────────────────────
+//
+// When a namespace (lua) app has no UserGameStatsSchema_<appid>.bin, we ask
+// Steam's server for the schema by sending CMsgClientGetUserStats (EMsg 818)
+// with schema_local_version=-1 ("send latest") on behalf of a SteamID that
+// OWNS the game (steam_id_for_user). The server only returns the schema to an
+// owner, so we rotate through a list of public accounts that own huge
+// libraries until one succeeds. Steam's own 819 response handler writes the
+// schema .bin to disk -- we only trigger the request.
+// (Technique verified against steamclient64 + SLScheevo / GBE_Tools.)
+
+// Public SteamID64s with very large libraries (subset of SLScheevo's list).
+static const uint64_t kSchemaOwnerIds[] = {
+    76561197978902089ull, // Terrum (https://steamcommunity.com/id/Terrum/)
+    76561198028121353ull, 76561198017975643ull, 76561198001678750ull,
+    76561198355953202ull, 76561197993544755ull, 76561198121643357ull,
+    76561198001237877ull, 76561197979911851ull, 76561198217186687ull,
+    76561198152618007ull, 76561197973009892ull, 76561198237402290ull,
+    76561198213148949ull, 76561198108581917ull, 76561198037867621ull,
+    76561197965319961ull, 76561197976597747ull, 76561198019712127ull,
+    76561198094227663ull, 76561197969050296ull,
+};
+
+// Apps we've already attempted a schema fetch for this session (avoid spamming).
+static std::mutex g_schemaFetchMutex;
+static std::unordered_set<uint32_t> g_schemaFetchAttempted;
+
+
+
+// Build and send one CMsgClientGetUserStats for (appId, ownerId). Returns false
+// if injection primitives aren't ready or send failed to dispatch.
+static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHandle) {
+    if (!g_pbMsgCtor || !g_pbMsgFinalize || !g_pbMsgCleanup ||
+        !g_getUserStatsDesc || !g_getUserStatsVtbl || !g_parseFromArray)
+        return false;
+
+    // CProtoBufMsg is ~72 bytes; over-allocate to be safe.
+    // Replicate Steam's exact CProtoBufMsg<CMsgClientGetUserStats> construction
+    // (sub_138A44F70): base ctor -> install TYPED vftable at msg[0] -> set body
+    // descriptor at +0x08 -> finalize. The typed vftable is mandatory: BAsyncSend
+    // serializes via vtbl+24/+32, and the base vftable produces a malformed wire
+    // message that fails the IPC pipe write (pipes.cpp:881) and crashes the client.
+    alignas(16) uint8_t msg[128] = {0};
+    g_pbMsgCtor(msg, (int)EMSG_CLIENT_GET_USER_STATS, 0);     // base ctor: emsg=818
+    *(void**)(msg + 0) = g_getUserStatsVtbl;                  // install typed vftable
+    *(void**)(msg + CPROTOBUFMSG_OFF_DESC) = g_getUserStatsDesc; // typed-body descriptor
+    g_pbMsgFinalize(msg);                                      // allocate body at +0x30
+
+    void* body = *(void**)(msg + CPROTOBUFMSG_OFF_BODY);
+    if (!body) { g_pbMsgCleanup(msg); return false; }
+
+    // Populate the message header (CMsgProtoBufHeader, pointer at msg+40). Two
+    // requirements for the server to accept and reply to the request:
+    //
+    //  1. Expiry sentinel (+192 = -1): the serialized-size vtable method asserts
+    //     at msgprotobuf.cpp:980 if the header's +192 is 0 ("timeout=0"). Steam's
+    //     ExpectingReply (sub_138CF1320) writes -1 = "wait for reply, no deadline".
+    //     Without it, BAsyncSend's size computation trips the assert and the IPC
+    //     pipe write fails -> client crash.
+    //
+    //  2. Session fields (steamid + client_sessionid + realm + a unique
+    //     jobid_source): the CM server SILENTLY DROPS a GetUserStats whose header
+    //     lacks these. Steam's own send fills them via its framework; our raw
+    //     BAsyncSend doesn't, so without this our header serializes empty and no
+    //     819 reply ever comes back. We copy the session values captured from
+    //     Steam's own GetUserStats and stamp a unique jobid_source.
+    //
+    // Field offsets / presence bits mapped from the live header object:
+    //   +104 steamid (fixed64, bit 0x40), +112 client_sessionid (int32, bit 0x80),
+    //   +156 realm (uint32, bit 0x80000000), +208 jobid_source (fixed64, bit 0x8000000).
+    static std::atomic<uint64_t> s_jobIdCounter{0x5C00000000000001ull};
+    if (void* hdr = *(void**)(msg + 0x28)) {
+        uint8_t* h = (uint8_t*)hdr;
+        *(int32_t*)(h + 192) = -1;                         // expiry = -1 (no deadline)
+        *(uint32_t*)(h + 16) &= ~0x4000000u;               // clear "no reply expected"
+        if (g_hdrCaptured.load(std::memory_order_relaxed)) {
+            uint64_t jobId = s_jobIdCounter.fetch_add(1, std::memory_order_relaxed);
+            *(uint64_t*)(h + 104) = g_hdrSteamId.load(std::memory_order_relaxed);  // steamid
+            *(uint32_t*)(h + 112) = g_hdrSessionId.load(std::memory_order_relaxed);// client_sessionid
+            *(uint32_t*)(h + 156) = g_hdrRealm.load(std::memory_order_relaxed);    // realm
+            *(uint64_t*)(h + 208) = jobId;                 // jobid_source (unique)
+            *(uint32_t*)(h + 16) |= (0x40u | 0x80u | 0x8000000u | 0x80000000u);    // presence bits
+        }
+    }
+
+    // Build CMsgClientGetUserStats body:
+    //   game_id#1 fixed64, crc_stats#2 varint, schema_local_version#3 int32(-1), steam_id_for_user#4 fixed64
+    PB::Writer w;
+    w.WriteFixed64(1, (uint64_t)appId);          // game_id (low 24 bits = appid)
+    w.WriteVarint(2, 0);                          // crc_stats = 0
+    // schema_local_version = -1 (int32). Proto encodes a negative int32 as a
+    // sign-extended 64-bit varint (0xFFFFFFFFFFFFFFFF), NOT 0xFFFFFFFF -- the
+    // latter reads as version 4294967295 ("up to date"), so the server sends no
+    // schema. Use the full 64-bit -1 so it means "send me the latest schema".
+    w.WriteVarint(3, (uint64_t)(int64_t)(-1));    // schema_local_version = -1 (send latest)
+    w.WriteFixed64(4, ownerId);                   // steam_id_for_user = owner
+
+    bool ok = ParseBytesToBody(body, w.Data().data(), w.Size());
+    if (!ok) { g_pbMsgCleanup(msg); return false; }
+
+    *(uint32_t*)(msg + CPROTOBUFMSG_OFF_CONN) = connHandle;
+
+    // The 819 response is correlated by game_id (appid); see TryHandleSchemaResponse.
+    auto basend = reinterpret_cast<BAsyncSendFn>(g_basOriginal);
+    uint8_t sent = basend ? basend(msg, connHandle) : 0;
+
+    g_pbMsgCleanup(msg);
+    return sent != 0;
+}
+
+// Handle an incoming CMsgClientGetUserStatsResponse (EMsg 819) for one of our
+// injected schema requests. Correlated by the response body's game_id (appid),
+// since the framework assigns its own jobid on send. If the owning account's
+// reply carries a schema, write UserGameStatsSchema_<appId>.bin (plus the
+// per-user stats template). Returns true if we consumed it.
+static bool TryHandleSchemaResponse(const uint8_t* data, uint32_t size) {
+    PacketView p;
+    if (!ParsePacket(data, size, p)) return false;
+
+    // Match the response to an app we asked about via game_id (field 1, fixed64).
+    auto bodyFields = PB::Parse(p.bodyData, p.bodyLen);
+    const PB::Field* gameIdF = PB::FindField(bodyFields, 1);
+    if (!gameIdF) return false;
+    uint32_t appId = (uint32_t)(gameIdF->varintVal & 0xFFFFFF);
+    if (appId == 0) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+        if (g_schemaFetchAttempted.find(appId) == g_schemaFetchAttempted.end())
+            return false;   // not an app we asked about
+    }
+
+    // Body = CMsgClientGetUserStatsResponse: eresult#2 int32, schema#4 bytes.
+    int32_t eresult = 2;
+    if (auto* er = PB::FindField(bodyFields, 2)) eresult = (int32_t)er->varintVal;
+    const PB::Field* schemaF = PB::FindField(bodyFields, 4);
+
+    bool hasSchema = (eresult == 1 && schemaF &&
+                      schemaF->wireType == PB::LengthDelimited && schemaF->dataLen > 0);
+    if (!hasSchema) {
+        // This owner doesn't own the game (or sent no schema) -- another owner's
+        // reply may still land it.
+        return true;
+    }
+
+    std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
+        + std::to_string(appId) + ".bin";
+    // Don't overwrite if a valid schema already arrived from a faster owner.
+    if (GetFileAttributesA(schemaPath.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+
+    HANDLE h = CreateFileA(schemaPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(h, schemaF->data, schemaF->dataLen, &written, nullptr);
+        CloseHandle(h);
+        LOG("[Schema] app %u: wrote schema (%u bytes) from server response",
+            appId, schemaF->dataLen);
+
+        // Steam also needs a per-user stats file (UserGameStats_<accountid>_<appid>.bin)
+        // to load this app's stats -- without it the schema loads but stats reading
+        // fails ("failed to load file into buffer"). Write the empty/template stats
+        // blob (binary KV: cache{ crc=0; PendingChanges=0 }) that SLScheevo copies.
+        // Only create it if absent so we never clobber real achievement progress.
+        uint32_t acctId = GetAccountId();
+        if (acctId != 0) {
+            static const uint8_t kUserStatsTemplate[38] = {
+                0x00,0x63,0x61,0x63,0x68,0x65,0x00,0x02,0x63,0x72,0x63,0x00,0x00,0x00,
+                0x00,0x00,0x02,0x50,0x65,0x6e,0x64,0x69,0x6e,0x67,0x43,0x68,0x61,0x6e,
+                0x67,0x65,0x73,0x00,0x00,0x00,0x00,0x00,0x08,0x08
+            };
+            std::string statsPath = g_steamPath + "appcache\\stats\\UserGameStats_"
+                + std::to_string(acctId) + "_" + std::to_string(appId) + ".bin";
+            if (GetFileAttributesA(statsPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                HANDLE hs = CreateFileA(statsPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hs != INVALID_HANDLE_VALUE) {
+                    DWORD w2 = 0;
+                    WriteFile(hs, kUserStatsTemplate, sizeof(kUserStatsTemplate), &w2, nullptr);
+                    CloseHandle(hs);
+                    LOG("[Schema] app %u: wrote per-user stats template (acct %u)", appId, acctId);
+                }
+            }
+        }
+    } else {
+        LOG("[Schema] app %u: failed to open %s for write (err=%u)",
+            appId, schemaPath.c_str(), GetLastError());
+    }
+    return true;
+}
+
+// Fetch the schema for one app by fanning requests across owner ids. Most owners
+// don't own the game (the server then replies minimally, often with no game_id),
+// so we DON'T block waiting per owner -- we fire all owners with gentle pacing and
+// let whichever owning account's 819 land the .bin (handled async in the recv
+// hook). The pacing (not blocking) is what keeps Steam's CM connection safe: 20
+// small messages spread over a few seconds instead of an instant burst.
+void RequestSchemaForApp(uint32_t appId) {
+#if !SCHEMA_FETCH_ENABLED
+    (void)appId; return;                              // kill-switch: see SCHEMA_FETCH_ENABLED
+#endif
+    if (!MetadataSync::schemaFetch.load(std::memory_order_relaxed)) return;
+    if (appId == 0) return;
+    if (g_liveConnHandle.load(std::memory_order_relaxed) == 0) return; // no conn yet
+
+    {
+        std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+        if (!g_schemaFetchAttempted.insert(appId).second) return;  // already tried
+    }
+
+    std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
+        + std::to_string(appId) + ".bin";
+    if (GetFileAttributesA(schemaPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    constexpr size_t kNumOwners = sizeof(kSchemaOwnerIds) / sizeof(kSchemaOwnerIds[0]);
+    // Enqueue one send per owner. The actual BAsyncSend happens on the network
+    // thread in DrainSchemaQueueOnNetThread (2 per tick), which both guarantees
+    // valid pipe/coroutine TLS and paces the traffic. Whichever owning account's
+    // 819 lands the .bin (handled async in the recv hook).
+    {
+        std::lock_guard<std::mutex> lock(g_schemaSendMutex);
+        for (uint64_t owner : kSchemaOwnerIds)
+            g_schemaSendQueue.push({appId, owner});
+    }
+    LOG("[Schema] app %u: queued %zu schema request(s)", appId, kNumOwners);
+}
+
+// One-time-per-session proactive sweep: request schemas for ALL namespace apps
+// that lack one on disk. This covers apps the user hasn't launched yet (which
+// otherwise never trigger an import, and so never request their schema). Fired
+// once a live CM connection handle is captured.
+static std::atomic<bool> g_schemaSweepDone{false};
+static void SweepNamespaceSchemas() {
+#if !SCHEMA_FETCH_ENABLED
+    return;                                             // kill-switch: see SCHEMA_FETCH_ENABLED
+#endif
+    if (g_schemaSweepDone.exchange(true)) return;       // once per session
+    if (g_liveConnHandle.load(std::memory_order_relaxed) == 0) {
+        g_schemaSweepDone.store(false);                 // retry on a later call
+        return;
+    }
+
+    std::vector<uint32_t> apps;
+    {
+        std::lock_guard<std::mutex> lock(g_namespaceAppsMutex);
+        apps.assign(g_namespaceApps.begin(), g_namespaceApps.end());
+    }
+    if (apps.empty()) return;
+
+    LOG("[Schema] Proactive sweep: checking %zu namespace app(s) for missing schemas", apps.size());
+    std::thread([apps] {
+        // Hard cap on how many apps we enqueue schema requests for per session,
+        // bounding the send queue (cap * owners). Sends are paced by the net-thread
+        // drain (2/tick), so this just limits total queued work.
+        constexpr int kMaxAppsPerSweep = 48;
+        int requested = 0;
+        for (uint32_t appId : apps) {
+            if (g_shuttingDown.load(std::memory_order_acquire)) break;
+
+            // Skip apps already cached on disk without counting against the cap.
+            std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
+                + std::to_string(appId) + ".bin";
+            if (GetFileAttributesA(schemaPath.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+
+            if (requested >= kMaxAppsPerSweep) {
+                LOG("[Schema] Sweep cap reached (%d apps); remaining deferred to next session",
+                    kMaxAppsPerSweep);
+                break;
+            }
+            RequestSchemaForApp(appId);   // enqueues only; net thread does the sends
+            ++requested;
+        }
+        LOG("[Schema] Proactive sweep complete: enqueued schemas for %d app(s)", requested);
+    }).detach();
 }
 
 void InstallGamesPlayedHook() {
@@ -4329,6 +4829,7 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
     // can leave responses queued long enough for Steam to time the jobs out. Outbound
     // packets are far more frequent during the cloud-RPC bursts that fill the queue.
     DrainInjectQueueOnNetThread();
+    DrainSchemaQueueOnNetThread();   // schema sends must run on the net thread
 
     // Try to discover the real CCMInterface via CSteamEngine global.
     // This also installs the vtable hook once CCMInterface is found.
