@@ -68,6 +68,19 @@ void SetAccountIdProvider(AccountIdProvider provider);
 using SchemaMissingCallback = std::function<void(uint32_t appId)>;
 void SetSchemaMissingCallback(SchemaMissingCallback cb);
 
+// Namespace-app predicate; reconcile uses it to seed playtime from localconfig.vdf
+// for managed apps before any stats JSON exists.
+using NamespacePredicate = std::function<bool(uint32_t appId)>;
+void SetNamespacePredicate(NamespacePredicate pred);
+
+// Seed apps at startup (cloud blob + native UserGameStats + local JSON) so
+// GetLastPlayedTimes has data before launch. Requires a logged-in accountId.
+void SeedApps(const std::vector<uint32_t>& appIds);
+
+// Re-pull + merge each app's cloud blob; returns apps whose playtime advanced
+// (another device played) for a live notification. Runs in the background.
+std::vector<uint32_t> RefreshFromCloud(const std::vector<uint32_t>& appIds);
+
 // Load stats for an app. Returns true if data exists on disk.
 bool LoadAppStats(uint32_t appId, AppStats& out);
 

@@ -479,6 +479,20 @@ bool UploadCloudMetadataText(uint32_t accountId, uint32_t appId,
     return uploaded;
 }
 
+// Queue an upload on the cloud work queue: thread-safe, unlike the sync variant
+// which races other curl calls off the work thread (libcurl init isn't reentrant).
+void UploadCloudMetadataTextAsync(uint32_t accountId, uint32_t appId,
+                                  const char* name, const std::string& content) {
+    if (!g_provider) return;
+    std::string path = CloudMetadataPath(accountId, appId, name);
+    ClearMissingMetadataPath(path);
+    CloudWorkQueue::WorkItem wi;
+    wi.type = CloudWorkQueue::WorkItem::Upload;
+    wi.cloudPath = std::move(path);
+    wi.data.assign(content.begin(), content.end());
+    CloudWorkQueue::EnqueueWork(std::move(wi));
+}
+
 void RemoveCloudMetadataIfPresent(uint32_t accountId, uint32_t appId,
                                           const char* name) {
     if (!g_provider || !g_provider->IsAuthenticated()) return;

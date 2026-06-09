@@ -2,6 +2,7 @@
 #include "json.h"
 #include "vdf.h"
 #include "log.h"
+#include "file_util.h"
 
 #include <fstream>
 #include <sstream>
@@ -31,6 +32,11 @@ static CloudPushFn g_cloudPush;
 static AccountIdProvider g_accountIdProvider;
 // Fired when an import finds no schema for an app (platform requests it).
 static SchemaMissingCallback g_schemaMissingCb;
+// True for apps we manage; reconcile seeds their playtime from localconfig.vdf.
+static NamespacePredicate g_isNamespaceApp;
+
+// Persist to disk; pushCloud=false writes locally only (used by startup reconcile).
+static void WriteAppStats(uint32_t appId, const AppStats& stats, bool pushCloud);
 
 void SetCloudProvider(CloudPullFn pull, CloudPushFn push) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -48,6 +54,11 @@ void SetSchemaMissingCallback(SchemaMissingCallback cb) {
     g_schemaMissingCb = std::move(cb);
 }
 
+void SetNamespacePredicate(NamespacePredicate pred) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_isNamespaceApp = std::move(pred);
+}
+
 // ── Native UserGameStats (BKV) reader ────────────────────────────────────
 // Steam stores per-user stats as a binary-KV tree in
 //   appcache\stats\UserGameStats_<accountId>_<appId>.bin
@@ -59,7 +70,6 @@ void SetSchemaMissingCallback(SchemaMissingCallback cb) {
 //           ├── data (INT/FLOAT/UINT64/INT64)   -- stat value (achievement: bitfield)
 //           └── AchievementTimes (SECTION)       -- optional
 //                 └── <bit> (INT)  -- unlock unix timestamp per bit index
-// Parser mirrors the (now-removed) bkv_stats.cpp reader.
 namespace {
 
 enum BkvType : uint8_t {
@@ -289,11 +299,19 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
         f.close();
         if (vdf.empty()) continue;
 
-        // Find the "Apps" section: UserLocalConfigStore > Software > Valve > Steam > Apps
-        const char* basePath[] = {"UserLocalConfigStore", "Software", "Valve", "Steam", "Apps"};
+        // Find the apps section: UserLocalConfigStore > Software > Valve > Steam > {Apps|apps}.
+        // Steam has shipped both casings of the leaf key across builds.
+        const char* appsKey = "apps";
+        const char* basePath[] = {"UserLocalConfigStore", "Software", "Valve", "Steam", appsKey};
         size_t appsStart = 0, appsEnd = 0;
-        if (!VdfUtil::FindVdfSectionRange(vdf, basePath, 5, appsStart, appsEnd))
-            continue;
+        if (!VdfUtil::FindVdfSectionRange(vdf, basePath, 5, appsStart, appsEnd)) {
+            appsKey = "Apps";
+            basePath[4] = appsKey;
+            if (!VdfUtil::FindVdfSectionRange(vdf, basePath, 5, appsStart, appsEnd)) {
+                LOG("[Stats] Reconcile: apps section not found in %s", lcPath.string().c_str());
+                continue;
+            }
+        }
 
         // Enumerate child sections (each is an appid)
         VdfUtil::ForEachChildInSection(vdf, basePath, 5, [&](std::string_view name) -> bool {
@@ -305,25 +323,27 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             }
             if (appId == 0) return true;
 
-            // Only reconcile apps we already track (namespace apps with stats JSON)
-            if (!fs::exists(StatsPath(appId), ec)) return true;
+            // We only manage namespace apps. Real owned games keep their native,
+            // server-tracked playtime and are never reconciled or synced.
+            bool isNs = g_isNamespaceApp && g_isNamespaceApp(appId);
+            if (!isNs) return true;
+            LOG("[Stats] Reconcile: considering app %u (ns=1)", appId);
 
-            // Read Playtime/Playtime2wks/LastPlayed from this app's VDF section
+            // localconfig "Apps\<id>\Playtime" is the server's cross-platform total
+            // (sub_1389C7930 -> sub_1389CB7D0 writes it from GetLastPlayedTimes
+            // response field 4), not this machine's minutes -- and we write it
+            // ourselves by answering those RPCs. So take only LastPlayed (a display
+            // hint) here; per-platform fields are owned by EndSession.
             std::string appIdStr = std::to_string(appId);
-            const char* appPath[] = {"UserLocalConfigStore", "Software", "Valve", "Steam", "Apps", appIdStr.c_str()};
-            uint32_t vdfPlaytime = 0, vdfPlaytime2wks = 0, vdfLastPlayed = 0;
+            const char* appPath[] = {"UserLocalConfigStore", "Software", "Valve", "Steam", appsKey, appIdStr.c_str()};
+            uint32_t vdfLastPlayed = 0;
 
             VdfUtil::ForEachFieldInSection(vdf, appPath, 6, [&](const VdfUtil::FieldInfo& fi) -> bool {
-                if (fi.key == "Playtime")
-                    try { vdfPlaytime = (uint32_t)std::stoul(std::string(fi.value)); } catch (...) {}
-                else if (fi.key == "Playtime2wks")
-                    try { vdfPlaytime2wks = (uint32_t)std::stoul(std::string(fi.value)); } catch (...) {}
-                else if (fi.key == "LastPlayed")
+                if (fi.key == "LastPlayed")
                     try { vdfLastPlayed = (uint32_t)std::stoul(std::string(fi.value)); } catch (...) {}
                 return true;
             });
-
-            if (vdfPlaytime == 0) return true;
+            if (vdfLastPlayed == 0) return true;
 
             auto cacheIt = g_cache.find(appId);
             if (cacheIt == g_cache.end()) {
@@ -332,25 +352,16 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             }
             AppStats& stats = cacheIt->second;
 
-            if (stats.playtime.minutesForever >= vdfPlaytime) return true;
+            if (vdfLastPlayed <= stats.playtime.lastPlayedTime) return true;
+            stats.playtime.lastPlayedTime = vdfLastPlayed;
 
-            // Local has more playtime -- update
-            uint32_t delta = vdfPlaytime - stats.playtime.minutesForever;
-            stats.playtime.minutesForever = vdfPlaytime;
-            stats.playtime.minutesLastTwoWeeks = (std::max)(stats.playtime.minutesLastTwoWeeks, vdfPlaytime2wks);
-            if (vdfLastPlayed > stats.playtime.lastPlayedTime)
-                stats.playtime.lastPlayedTime = vdfLastPlayed;
-#ifdef _WIN32
-            stats.playtime.playtimeWindows += delta;
-#elif defined(__APPLE__)
-            stats.playtime.playtimeMac += delta;
-#else
-            stats.playtime.playtimeLinux += delta;
-#endif
-            SaveAppStats(appId, stats);
+            // Local-only persist: startup reconcile must not push to the cloud.
+            WriteAppStats(appId, stats, false);
             reconciled++;
-            LOG("[Stats] Reconciled app %u from localconfig: %u -> %u min (+%u)",
-                appId, vdfPlaytime - delta, vdfPlaytime, delta);
+            LOG("[Stats] Reconciled app %u lastPlayed=%u (playtime owned by session tracking: win=%u mac=%u linux=%u)",
+                appId, vdfLastPlayed,
+                stats.playtime.playtimeWindows, stats.playtime.playtimeMac,
+                stats.playtime.playtimeLinux);
             return true;
         });
     }
@@ -380,10 +391,10 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
     uint32_t accountId = g_accountIdProvider();
     if (accountId == 0) return false;
 
-    // Schema: appcache\stats\UserGameStatsSchema_<appId>.bin
+    // Schema: appcache/stats/UserGameStatsSchema_<appId>.bin
     {
-        std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
-            + std::to_string(appId) + ".bin";
+        fs::path schemaPath = FileUtil::Utf8ToPath(g_steamPath) / "appcache" / "stats"
+            / ("UserGameStatsSchema_" + std::to_string(appId) + ".bin");
         std::ifstream sf(schemaPath, std::ios::binary);
         if (sf.good()) {
             out.schema.assign(std::istreambuf_iterator<char>(sf),
@@ -395,9 +406,9 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
             g_schemaMissingCb(appId);
     }
 
-    // Stats: appcache\stats\UserGameStats_<accountId>_<appId>.bin
-    std::string statsPath = g_steamPath + "appcache\\stats\\UserGameStats_"
-        + std::to_string(accountId) + "_" + std::to_string(appId) + ".bin";
+    // Stats: appcache/stats/UserGameStats_<accountId>_<appId>.bin
+    fs::path statsPath = FileUtil::Utf8ToPath(g_steamPath) / "appcache" / "stats"
+        / ("UserGameStats_" + std::to_string(accountId) + "_" + std::to_string(appId) + ".bin");
     std::ifstream f(statsPath, std::ios::binary);
     if (!f.good()) return false;
     std::vector<uint8_t> blob((std::istreambuf_iterator<char>(f)),
@@ -577,26 +588,58 @@ static std::string BuildAppStatsJson(const AppStats& stats) {
     return Json::Stringify(root);
 }
 
+// Max-merge each platform's forever field (the total is their sum), so a stale
+// local or older cloud blob can't regress another device's time.
+static void MergePlaytime(PlaytimeData& dst, const PlaytimeData& src) {
+    dst.playtimeWindows = (std::max)(dst.playtimeWindows, src.playtimeWindows);
+    dst.playtimeMac     = (std::max)(dst.playtimeMac,     src.playtimeMac);
+    dst.playtimeLinux   = (std::max)(dst.playtimeLinux,   src.playtimeLinux);
+    dst.minutesLastTwoWeeks = (std::max)(dst.minutesLastTwoWeeks, src.minutesLastTwoWeeks);
+    dst.lastPlayedTime  = (std::max)(dst.lastPlayedTime,  src.lastPlayedTime);
+    dst.minutesForever  = dst.playtimeWindows + dst.playtimeMac + dst.playtimeLinux;
+}
+
 bool LoadAppStats(uint32_t appId, AppStats& out) {
     std::string path = StatsPath(appId);
-    std::string content;
+    bool haveLocal = false;
 
     std::ifstream f(path);
     if (f.good()) {
-        content.assign((std::istreambuf_iterator<char>(f)),
-                       std::istreambuf_iterator<char>());
+        std::string local((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
         f.close();
-    } else if (g_cloudPull && g_cloudPull(appId, content) && !content.empty()) {
-        // No local copy; pull the cloud blob and materialize it locally so
-        // subsequent reads hit disk and FlushAll round-trips correctly.
-        std::ofstream wf(path, std::ios::trunc);
-        wf << content;
-        wf.close();
-        LOG("[Stats] Pulled app %u stats from cloud (%zu bytes)", appId, content.size());
+        if (!local.empty() && ParseAppStatsJson(local, out))
+            haveLocal = true;
     }
 
-    if (content.empty()) return false;
-    if (!ParseAppStatsJson(content, out)) return false;
+    // Always consult the cloud and merge per-platform: a local copy from a
+    // prior session must not hide another device's playtime in the cloud.
+    std::string cloud;
+    if (g_cloudPull && g_cloudPull(appId, cloud) && !cloud.empty()) {
+        AppStats cloudStats;
+        if (ParseAppStatsJson(cloud, cloudStats)) {
+            if (!haveLocal) {
+                out = std::move(cloudStats);
+                haveLocal = true;
+            } else {
+                MergePlaytime(out.playtime, cloudStats.playtime);
+                // Adopt cloud achievements/stats/schema when we hold none.
+                if (out.stats.empty() && !cloudStats.stats.empty())
+                    out.stats = std::move(cloudStats.stats);
+                if (out.achievements.empty() && !cloudStats.achievements.empty())
+                    out.achievements = std::move(cloudStats.achievements);
+                if (out.schema.empty() && !cloudStats.schema.empty())
+                    out.schema = std::move(cloudStats.schema);
+            }
+            // Materialize the merged result locally for fast subsequent reads.
+            WriteAppStats(appId, out, false);
+            LOG("[Stats] Merged app %u with cloud blob (forever=%u win=%u mac=%u linux=%u)",
+                appId, out.playtime.minutesForever, out.playtime.playtimeWindows,
+                out.playtime.playtimeMac, out.playtime.playtimeLinux);
+        }
+    }
+
+    if (!haveLocal) return false;
 
     // Load schema blob if exists (separate binary sidecar).
     std::string schemaPath = SchemaPath(appId);
@@ -608,7 +651,9 @@ bool LoadAppStats(uint32_t appId, AppStats& out) {
     return true;
 }
 
-void SaveAppStats(uint32_t appId, const AppStats& stats) {
+// Persist locally and, when pushCloud, queue a cloud upload. Reconcile writes
+// locally only; the cloud is written on session end, when playtime accrues.
+static void WriteAppStats(uint32_t appId, const AppStats& stats, bool pushCloud) {
     std::string path = StatsPath(appId);
     std::string json = BuildAppStatsJson(stats);
 
@@ -616,15 +661,17 @@ void SaveAppStats(uint32_t appId, const AppStats& stats) {
     f << json;
     f.close();
 
-    // Save schema blob separately if present
     if (!stats.schema.empty()) {
         std::string schemaPath = SchemaPath(appId);
         std::ofstream sf(schemaPath, std::ios::binary | std::ios::trunc);
         sf.write(reinterpret_cast<const char*>(stats.schema.data()), stats.schema.size());
     }
 
-    // Cloud-back the stats document (fire-and-forget; provider queues upload).
-    if (g_cloudPush) g_cloudPush(appId, json);
+    if (pushCloud && g_cloudPush) g_cloudPush(appId, json);
+}
+
+void SaveAppStats(uint32_t appId, const AppStats& stats) {
+    WriteAppStats(appId, stats, true);
 }
 
 // Apps for which native import has been successfully attempted (imported real
@@ -677,6 +724,41 @@ AppStats& GetOrCreate(uint32_t appId) {
     }
     EnsureNativeImportLocked(appId, stats);
     return stats;
+}
+
+void SeedApps(const std::vector<uint32_t>& appIds) {
+    for (uint32_t appId : appIds) {
+        if (appId == 0) continue;
+        GetOrCreate(appId);  // pulls cloud blob + imports native + loads local
+    }
+}
+
+std::vector<uint32_t> RefreshFromCloud(const std::vector<uint32_t>& appIds) {
+    std::vector<uint32_t> changed;
+    if (!g_cloudPull) return changed;
+    for (uint32_t appId : appIds) {
+        if (appId == 0) continue;
+        std::string cloud;
+        if (!g_cloudPull(appId, cloud) || cloud.empty()) continue;
+        AppStats cloudStats;
+        if (!ParseAppStatsJson(cloud, cloudStats)) continue;
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        AppStats& cur = g_cache[appId];
+        PlaytimeData before = cur.playtime;
+        MergePlaytime(cur.playtime, cloudStats.playtime);
+        // Another device advanced this app's playtime -> persist locally and report.
+        if (cur.playtime.minutesForever != before.minutesForever ||
+            cur.playtime.lastPlayedTime != before.lastPlayedTime) {
+            WriteAppStats(appId, cur, false);
+            changed.push_back(appId);
+            LOG("[Stats] Cloud advanced app %u: forever %u -> %u (win=%u mac=%u linux=%u)",
+                appId, before.minutesForever, cur.playtime.minutesForever,
+                cur.playtime.playtimeWindows, cur.playtime.playtimeMac,
+                cur.playtime.playtimeLinux);
+        }
+    }
+    return changed;
 }
 
 // Deterministic, order-independent CRC over stat values AND achievement
@@ -833,10 +915,8 @@ void EndSession(uint32_t appId) {
     g_activeSessions.erase(it);
 
     auto& stats = g_cache[appId];
-    stats.playtime.minutesForever += minutes;
-    stats.playtime.minutesLastTwoWeeks += minutes;
-    stats.playtime.lastPlayedTime = now;
-
+    // Accrue only this platform's field; a session here can't overwrite another
+    // device's cloud playtime.
 #ifdef _WIN32
     stats.playtime.playtimeWindows += minutes;
 #elif defined(__APPLE__)
@@ -844,7 +924,12 @@ void EndSession(uint32_t appId) {
 #else
     stats.playtime.playtimeLinux += minutes;
 #endif
+    stats.playtime.minutesForever = stats.playtime.playtimeWindows
+        + stats.playtime.playtimeMac + stats.playtime.playtimeLinux;
+    stats.playtime.minutesLastTwoWeeks += minutes;
+    stats.playtime.lastPlayedTime = now;
 
+    // Queue the push (not a blocking curl on the net thread, which raced at close).
     g_dirty[appId] = true;
     SaveAppStats(appId, stats);
     g_dirty[appId] = false;

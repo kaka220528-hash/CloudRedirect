@@ -102,6 +102,9 @@ bool DownloadCloudMetadataWithLegacyFallback(uint32_t accountId, uint32_t appId,
     std::vector<uint8_t>& outData, bool* outUsedLegacy = nullptr);
 bool UploadCloudMetadataText(uint32_t accountId, uint32_t appId,
     const char* name, const std::string& content);
+// Queued (thread-safe) variant: serializes on the cloud work queue.
+void UploadCloudMetadataTextAsync(uint32_t accountId, uint32_t appId,
+    const char* name, const std::string& content);
 void RemoveCloudMetadataIfPresent(uint32_t accountId, uint32_t appId, const char* name);
 void RemoveLegacyCloudMetadataIfCanonicalExists(uint32_t accountId, uint32_t appId,
     const char* canonicalName, const char* legacyName);
