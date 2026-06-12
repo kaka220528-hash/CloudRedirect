@@ -15,6 +15,8 @@
 
 namespace CloudStorage {
 
+struct CloudAppState; // defined in app_state.h
+
 void Init(const std::string& localRoot, std::unique_ptr<ICloudProvider> provider);
 void Shutdown();
 bool IsCloudActive();
@@ -45,6 +47,12 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
                                  uint64_t batchId,
                                  const std::vector<std::string>& uploads,
                                  const std::vector<std::string>& deletes);
+
+// Verifies every file in `state` has its CAS blob durably on the provider before
+// its manifest is published; heals from the local cache or drops phantom entries.
+// Returns false only when the cloud blob listing is unavailable (don't publish).
+bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
+                                     CloudAppState& state);
 
 std::vector<uint64_t> ListStagedBatchIds(uint32_t accountId, uint32_t appId);
 bool RemoveStagedBatch(uint32_t accountId, uint32_t appId, uint64_t batchId);

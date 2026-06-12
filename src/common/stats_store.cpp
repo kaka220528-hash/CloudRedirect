@@ -11,6 +11,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstring>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -26,8 +27,16 @@ static std::unordered_map<uint32_t, AppStats> g_cache;
 static std::unordered_map<uint32_t, bool> g_dirty;
 
 // Cloud-backing provider (installed by the platform layer; see SetCloudProvider).
-static CloudPullFn g_cloudPull;
-static CloudPushFn g_cloudPush;
+// Account-wide blob: one network read for every app, not one per app.
+static CloudPullAllFn g_cloudPullAll;
+static CloudPushAllFn g_cloudPushAll;
+
+// Last account blob pulled from cloud (appId -> stats JSON). Populated by one
+// network read; per-app load/merge reads from here. Guarded by g_mutex.
+static std::unordered_map<uint32_t, std::string> g_cloudBlobByApp;
+// Set when an app's entry in g_cloudBlobByApp changed and the account blob needs
+// to be re-uploaded; cleared by PushAccountBlobIfDirty. Guarded by g_mutex.
+static bool g_accountBlobDirty = false;
 
 // Resolves the current Steam accountId for locating native UserGameStats blobs.
 static AccountIdProvider g_accountIdProvider;
@@ -42,10 +51,35 @@ static void WriteAppStats(uint32_t appId, const AppStats& stats, bool pushCloud)
 // Playtime helpers (defined below; forward-declared for use in (de)serialization).
 static void RecomputePlaytimeTotals(PlaytimeData& pt);
 
-void SetCloudProvider(CloudPullFn pull, CloudPushFn push) {
+void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_cloudPull = std::move(pull);
-    g_cloudPush = std::move(push);
+    g_cloudPullAll = std::move(pullAll);
+    g_cloudPushAll = std::move(pushAll);
+}
+
+// Pull the account-wide blob once into g_cloudBlobByApp. Network I/O; caller must
+// not hold g_mutex. Returns true if fetched (even if empty).
+static bool RefreshCloudBlobCache() {
+    CloudPullAllFn pull;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        pull = g_cloudPullAll;
+    }
+    if (!pull) return false;
+
+    std::unordered_map<uint32_t, std::string> fetched;
+    if (!pull(fetched)) return false;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_cloudBlobByApp = std::move(fetched);
+    return true;
+}
+
+// Return the cached cloud JSON for one app (from the last account-blob pull).
+// Caller holds g_mutex. Empty string if the app has no cloud stats.
+static std::string CloudJsonForAppLocked(uint32_t appId) {
+    auto it = g_cloudBlobByApp.find(appId);
+    return it != g_cloudBlobByApp.end() ? it->second : std::string();
 }
 
 void SetAccountIdProvider(AccountIdProvider provider) {
@@ -333,21 +367,26 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             if (!isNs) return true;
             LOG("[Stats] Reconcile: considering app %u (ns=1)", appId);
 
-            // localconfig "Apps\<id>\Playtime" is the server's cross-platform total
-            // (sub_1389C7930 -> sub_1389CB7D0 writes it from GetLastPlayedTimes
-            // response field 4), not this machine's minutes -- and we write it
-            // ourselves by answering those RPCs. So take only LastPlayed (a display
-            // hint) here; per-platform fields are owned by EndSession.
+            // CR normally writes localconfig Playtime itself, so reading it back is
+            // circular -- except on first run from a pre-playtime CR version, where
+            // it's the only record of past minutes. Seed it once so we don't serve
+            // zeros and wipe the displayed playtime.
             std::string appIdStr = std::to_string(appId);
             const char* appPath[] = {"UserLocalConfigStore", "Software", "Valve", "Steam", appsKey, appIdStr.c_str()};
             uint32_t vdfLastPlayed = 0;
+            uint32_t vdfPlaytime = 0;
+            uint32_t vdfPlaytime2wks = 0;
 
             VdfUtil::ForEachFieldInSection(vdf, appPath, 6, [&](const VdfUtil::FieldInfo& fi) -> bool {
                 if (fi.key == "LastPlayed")
                     try { vdfLastPlayed = (uint32_t)std::stoul(std::string(fi.value)); } catch (...) {}
+                else if (fi.key == "Playtime")
+                    try { vdfPlaytime = (uint32_t)std::stoul(std::string(fi.value)); } catch (...) {}
+                else if (fi.key == "Playtime2wks")
+                    try { vdfPlaytime2wks = (uint32_t)std::stoul(std::string(fi.value)); } catch (...) {}
                 return true;
             });
-            if (vdfLastPlayed == 0) return true;
+            if (vdfLastPlayed == 0 && vdfPlaytime == 0) return true;
 
             auto cacheIt = g_cache.find(appId);
             if (cacheIt == g_cache.end()) {
@@ -356,16 +395,40 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             }
             AppStats& stats = cacheIt->second;
 
-            if (vdfLastPlayed <= stats.playtime.lastPlayedTime) return true;
-            stats.playtime.lastPlayedTime = vdfLastPlayed;
+            bool changed = false;
+            if (vdfLastPlayed > stats.playtime.lastPlayedTime) {
+                stats.playtime.lastPlayedTime = vdfLastPlayed;
+                changed = true;
+            }
+
+            // First-run migration: seed the localconfig total into a dedicated
+            // bucket so it's surfaced and max'd across devices without
+            // double-counting later CR-tracked sessions (keyed by hostname).
+            static const std::string kMigratedBucket = "__migrated_localconfig";
+            if (stats.playtime.perDevice.empty() && vdfPlaytime > 0) {
+                DevicePlaytime& mig = stats.playtime.perDevice[kMigratedBucket];
+#ifdef _WIN32
+                mig.windows = vdfPlaytime;
+#elif defined(__APPLE__)
+                mig.mac = vdfPlaytime;
+#else
+                mig.lin = vdfPlaytime;
+#endif
+                stats.playtime.minutesLastTwoWeeks =
+                    (std::max)(stats.playtime.minutesLastTwoWeeks, vdfPlaytime2wks);
+                RecomputePlaytimeTotals(stats.playtime);
+                changed = true;
+            }
+
+            if (!changed) return true;
 
             // Local-only persist: startup reconcile must not push to the cloud.
             WriteAppStats(appId, stats, false);
             reconciled++;
-            LOG("[Stats] Reconciled app %u lastPlayed=%u (playtime owned by session tracking: win=%u mac=%u linux=%u)",
+            LOG("[Stats] Reconciled app %u lastPlayed=%u (win=%u mac=%u linux=%u, migrated=%u)",
                 appId, vdfLastPlayed,
                 stats.playtime.playtimeWindows, stats.playtime.playtimeMac,
-                stats.playtime.playtimeLinux);
+                stats.playtime.playtimeLinux, vdfPlaytime);
             return true;
         });
     }
@@ -817,10 +880,12 @@ bool LoadAppStats(uint32_t appId, AppStats& out) {
             haveLocal = true;
     }
 
-    // Always consult the cloud and merge per-platform: a local copy from a
-    // prior session must not hide another device's playtime in the cloud.
-    std::string cloud;
-    if (g_cloudPull && g_cloudPull(appId, cloud) && !cloud.empty()) {
+    // Consult the cached account blob (pulled once by SeedApps/RefreshFromCloud)
+    // and merge per-platform: a local copy from a prior session must not hide
+    // another device's playtime/unlocks in the cloud. No per-app network read --
+    // the whole account blob was fetched in one shot.
+    std::string cloud = CloudJsonForAppLocked(appId);
+    if (!cloud.empty()) {
         AppStats cloudStats;
         if (ParseAppStatsJson(cloud, cloudStats)) {
             if (!haveLocal) {
@@ -873,7 +938,33 @@ static void WriteAppStats(uint32_t appId, const AppStats& stats, bool pushCloud)
         sf.write(reinterpret_cast<const char*>(stats.schema.data()), stats.schema.size());
     }
 
-    if (pushCloud && g_cloudPush) g_cloudPush(appId, json);
+    if (pushCloud) {
+        // Update this app's entry in the cached account blob and flag the blob
+        // for upload. The actual cloud write is a single coalesced account-blob
+        // push (PushAccountBlobIfDirty), not a per-app round-trip.
+        g_cloudBlobByApp[appId] = json;
+        g_accountBlobDirty = true;
+    }
+}
+
+// Push the account-wide stats blob if any app changed since the last push (one
+// write for all apps). The push does blocking curl I/O, so it must run off the
+// caller's thread -- EndSession runs on Steam's GamesPlayed net thread at exit,
+// where a synchronous request crashed. Copy the snapshot under the lock and hand
+// the RMW to a detached worker.
+static void PushAccountBlobIfDirty() {
+    CloudPushAllFn push;
+    std::unordered_map<uint32_t, std::string> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_accountBlobDirty || !g_cloudPushAll) return;
+        push = g_cloudPushAll;
+        snapshot = g_cloudBlobByApp;     // copy under lock
+        g_accountBlobDirty = false;       // clear before releasing (re-set on later change)
+    }
+    std::thread([push = std::move(push), snapshot = std::move(snapshot)]() {
+        push(snapshot);
+    }).detach();
 }
 
 void SaveAppStats(uint32_t appId, const AppStats& stats) {
@@ -933,16 +1024,22 @@ static bool ReimportNativeStatsLocked(uint32_t appId, AppStats& stats) {
 }
 
 void CaptureNativeUnlocks(uint32_t appId) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto& stats = g_cache[appId];
-    // Make sure the base data exists (first observation may precede any import).
-    if (stats.stats.empty()) EnsureNativeImportLocked(appId, stats);
-    if (ReimportNativeStatsLocked(appId, stats)) {
-        g_dirty[appId] = true;
-        SaveAppStats(appId, stats);   // pushes to cloud
-        g_dirty[appId] = false;
-        LOG("[Stats] Captured native unlocks for app %u (crc=%u)", appId, stats.crcStats);
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto& stats = g_cache[appId];
+        // Make sure the base data exists (first observation may precede any import).
+        if (stats.stats.empty()) EnsureNativeImportLocked(appId, stats);
+        if (ReimportNativeStatsLocked(appId, stats)) {
+            g_dirty[appId] = true;
+            SaveAppStats(appId, stats);   // updates account blob + dirty flag
+            g_dirty[appId] = false;
+            changed = true;
+            LOG("[Stats] Captured native unlocks for app %u (crc=%u)", appId, stats.crcStats);
+        }
     }
+    // A genuine unlock just landed -- push the account blob now (off-lock).
+    if (changed) PushAccountBlobIfDirty();
 }
 
 // Core seed/lookup. Caller MUST hold g_mutex. Returns a live cache reference.
@@ -992,23 +1089,29 @@ void ResetStats(uint32_t appId) {
 }
 
 void SeedApps(const std::vector<uint32_t>& appIds) {
+    // One network read for the whole account, not one per app. GetOrCreate then
+    // reads each app's entry from the cached blob (no further network).
+    RefreshCloudBlobCache();
     for (uint32_t appId : appIds) {
         if (appId == 0) continue;
-        GetOrCreate(appId);  // pulls cloud blob + imports native + loads local
+        GetOrCreate(appId);  // merges cached cloud blob + imports native + loads local
     }
+    // SeedApps also materializes imported native stats; flush the account blob
+    // once so newly-seeded local stats reach the cloud.
+    PushAccountBlobIfDirty();
 }
 
 std::vector<uint32_t> RefreshFromCloud(const std::vector<uint32_t>& appIds) {
     std::vector<uint32_t> changed;
-    if (!g_cloudPull) return changed;
+    // One network read for the whole account, then iterate from the cache.
+    if (!RefreshCloudBlobCache()) return changed;
     for (uint32_t appId : appIds) {
         if (appId == 0) continue;
-        std::string cloud;
-        if (!g_cloudPull(appId, cloud) || cloud.empty()) continue;
-        AppStats cloudStats;
-        if (!ParseAppStatsJson(cloud, cloudStats)) continue;
 
         std::lock_guard<std::mutex> lock(g_mutex);
+        AppStats cloudStats;
+        std::string cloud = CloudJsonForAppLocked(appId);
+        if (cloud.empty() || !ParseAppStatsJson(cloud, cloudStats)) continue;
         // Hydrate from disk on a cache miss BEFORE merging: operator[] would
         // otherwise default-construct an EMPTY record, and WriteAppStats would
         // then truncate a populated local <appId>.json (stats/achievements wiped,
@@ -1190,37 +1293,41 @@ void StartSession(uint32_t appId) {
 }
 
 void EndSession(uint32_t appId) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_activeSessions.find(appId);
-    if (it == g_activeSessions.end()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_activeSessions.find(appId);
+        if (it == g_activeSessions.end()) return;
 
-    uint32_t now = NowUnix();
-    uint32_t elapsed = (now > it->second) ? (now - it->second) : 0;
-    uint32_t minutes = elapsed / 60;
-    g_activeSessions.erase(it);
+        uint32_t now = NowUnix();
+        uint32_t elapsed = (now > it->second) ? (now - it->second) : 0;
+        uint32_t minutes = elapsed / 60;
+        g_activeSessions.erase(it);
 
-    auto& stats = g_cache[appId];
-    // Accrue onto THIS device's own per-device sub-total (keyed by device id), so
-    // a session here can never overwrite another device's contribution -- even a
-    // same-platform device's -- under the last-writer-wins cloud blob.
-    AccrueLocalPlaytime(stats.playtime, minutes);
-    stats.playtime.minutesLastTwoWeeks += minutes;
-    stats.playtime.lastPlayedTime = now;
+        auto& stats = g_cache[appId];
+        // Accrue onto THIS device's own per-device sub-total (keyed by device id), so
+        // a session here can never overwrite another device's contribution -- even a
+        // same-platform device's -- under the last-writer-wins cloud blob.
+        AccrueLocalPlaytime(stats.playtime, minutes);
+        stats.playtime.minutesLastTwoWeeks += minutes;
+        stats.playtime.lastPlayedTime = now;
 
-    // Steam flushes the native blob on game close; merge any new unlocks (also
-    // catches another device's). Gated on sync_achievements, not sync_playtime
-    // (EndSession runs under the latter).
-    if (MetadataSync::syncAchievements.load(std::memory_order_relaxed) &&
-        ReimportNativeStatsLocked(appId, stats))
-        LOG("[Stats] Session end: merged new native achievements/stats for app %u (crc=%u)",
-            appId, stats.crcStats);
+        // Steam flushes the native blob on game close; merge any new unlocks (also
+        // catches another device's). Gated on sync_achievements, not sync_playtime
+        // (EndSession runs under the latter).
+        if (MetadataSync::syncAchievements.load(std::memory_order_relaxed) &&
+            ReimportNativeStatsLocked(appId, stats))
+            LOG("[Stats] Session end: merged new native achievements/stats for app %u (crc=%u)",
+                appId, stats.crcStats);
 
-    // Queue the push (not a blocking curl on the net thread, which raced at close).
-    g_dirty[appId] = true;
-    SaveAppStats(appId, stats);
-    g_dirty[appId] = false;
-    LOG("[Stats] Session ended for app %u: +%u min (total %u)",
-        appId, minutes, stats.playtime.minutesForever);
+        g_dirty[appId] = true;
+        SaveAppStats(appId, stats);   // updates account blob + dirty flag
+        g_dirty[appId] = false;
+        LOG("[Stats] Session ended for app %u: +%u min (total %u)",
+            appId, minutes, stats.playtime.minutesForever);
+    }
+    // Push the account blob off-lock (the platform pushAll queues it async, so
+    // this never blocks the net thread at game close).
+    PushAccountBlobIfDirty();
 }
 
 PlaytimeData GetPlaytime(uint32_t appId) {
@@ -1251,17 +1358,21 @@ std::vector<uint32_t> GetTrackedApps() {
 }
 
 void FlushAll() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    for (auto& [appId, dirty] : g_dirty) {
-        if (dirty) {
-            auto it = g_cache.find(appId);
-            if (it != g_cache.end()) {
-                SaveAppStats(appId, it->second);
-                LOG("[Stats] Flushed app %u to disk", appId);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto& [appId, dirty] : g_dirty) {
+            if (dirty) {
+                auto it = g_cache.find(appId);
+                if (it != g_cache.end()) {
+                    SaveAppStats(appId, it->second);  // updates account blob + dirty flag
+                    LOG("[Stats] Flushed app %u to disk", appId);
+                }
+                dirty = false;
             }
-            dirty = false;
         }
     }
+    // Push the account blob once for all flushed apps (outside the lock).
+    PushAccountBlobIfDirty();
 }
 
 } // namespace StatsStore

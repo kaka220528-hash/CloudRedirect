@@ -253,9 +253,9 @@ static constexpr size_t MAX_STATE_SIZE = 16 * 1024 * 1024; // 16 MB
 
 static StateFetchResult FetchCloudStateLive(uint32_t accountId, uint32_t appId) {
     InflightSyncScope guard;
-    if (!guard) return { StateFetchStatus::FetchFailed, {}, {} };
+    if (!guard) return { StateFetchStatus::FetchFailed, {} };
     if (!g_stateProvider || !g_stateProvider->IsAuthenticated())
-        return { StateFetchStatus::FetchFailed, {}, {} };
+        return { StateFetchStatus::FetchFailed, {} };
 
     std::string statePath = CloudMetadataPath(accountId, appId, kStateFilename);
     std::vector<uint8_t> data;
@@ -263,19 +263,19 @@ static StateFetchResult FetchCloudStateLive(uint32_t accountId, uint32_t appId) 
         if (data.size() > MAX_STATE_SIZE) {
             LOG("[AppState] FetchCloudState app %u: state file too large (%zu bytes)",
                 appId, data.size());
-            return { StateFetchStatus::ParseFailed, {}, {} };
+            return { StateFetchStatus::ParseFailed, {} };
         }
         std::string json(data.begin(), data.end());
         CloudAppState state;
         if (!DeserializeState(json, state)) {
             LOG("[AppState] FetchCloudState app %u: parse failed", appId);
-            return { StateFetchStatus::ParseFailed, {}, {} };
+            return { StateFetchStatus::ParseFailed, {} };
         }
         // cn>0 with empty files is valid (user deleted all saves).
         // AutoCloudImport repopulates from disk if local files exist.
         LOG("[AppState] FetchCloudState app %u: loaded state CN=%llu, %zu files",
             appId, state.cn, state.files.size());
-        return { StateFetchStatus::Ok, std::move(state), {} };
+        return { StateFetchStatus::Ok, std::move(state) };
     }
 
     auto existsStatus = g_stateProvider->CheckExists(statePath);
@@ -355,15 +355,15 @@ static StateFetchResult FetchCloudStateLive(uint32_t accountId, uint32_t appId) 
                 LOG("[AppState] FetchCloudState app %u: legacy files cleaned up", appId);
             }
 
-            return { StateFetchStatus::Ok, std::move(state), {} };
+            return { StateFetchStatus::Ok, std::move(state) };
         }
 
         LOG("[AppState] FetchCloudState app %u: no state file and no legacy data", appId);
-        return { StateFetchStatus::NotFound, {}, {} };
+        return { StateFetchStatus::NotFound, {} };
     }
 
     LOG("[AppState] FetchCloudState app %u: download failed", appId);
-    return { StateFetchStatus::FetchFailed, {}, {} };
+    return { StateFetchStatus::FetchFailed, {} };
 }
 
 // Public always-fresh fetch. Performs the live read AND refreshes the serve
@@ -397,8 +397,7 @@ StateFetchResult FetchCloudStateForServe(uint32_t accountId, uint32_t appId) {
 }
 
 bool PublishCloudState(uint32_t accountId, uint32_t appId,
-                       const CloudAppState& state,
-                       const std::string& /*etag*/) {
+                       const CloudAppState& state, bool lockOnly) {
     InflightSyncScope guard;
     if (!guard) return false;
     if (!g_stateProvider || !g_stateProvider->IsAuthenticated()) {
@@ -406,7 +405,30 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
         return false;
     }
 
-    std::string json = SerializeState(state);
+    // Heal or drop any manifest entry whose blob isn't durable on the provider, so
+    // we never publish a state pointing at blobs that 404 elsewhere. lockOnly skips
+    // it: a session-release publish reuses the manifest CompleteBatch just verified.
+    CloudAppState verified = state;
+    if (!lockOnly && !VerifyAndHealManifestForPublish(accountId, appId, verified)) {
+        LOG("[AppState] PublishCloudState app %u: cannot verify blobs, deferring publish", appId);
+        return false;
+    }
+
+    // Refuse to move the changenumber backward, like the real server. Re-fetch the
+    // cloud CN and reject a stale RMW (e.g. the session lock republish) that would
+    // clobber a newer CN another machine published in the window. Equal CN is fine.
+    {
+        auto current = FetchCloudStateLive(accountId, appId);
+        if (current.status == StateFetchStatus::Ok && current.state.cn > verified.cn) {
+            LOG("[AppState] PublishCloudState app %u: REFUSED -- cloud CN=%llu is newer than "
+                "publish CN=%llu (would regress changelist); leaving cloud state intact",
+                appId, (unsigned long long)current.state.cn,
+                (unsigned long long)verified.cn);
+            return false;
+        }
+    }
+
+    std::string json = SerializeState(verified);
     std::string statePath = CloudMetadataPath(accountId, appId, kStateFilename);
 
     if (!g_stateProvider->Upload(statePath,
@@ -429,7 +451,7 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
     InvalidateServeCache(accountId, appId);
 
     LOG("[AppState] PublishCloudState app %u: published CN=%llu, %zu files",
-        appId, state.cn, state.files.size());
+        appId, verified.cn, verified.files.size());
     return true;
 }
 
@@ -443,25 +465,11 @@ void ReleaseCloudSession(uint32_t accountId, uint32_t appId, uint64_t clientId) 
 
     auto& state = result.state;
     if (state.session.clientId == clientId || clientId == 0) {
-        // Reconcile stale file list from local manifest if previous publish failed.
-        uint64_t localCN = LocalStorage::GetChangeNumber(accountId, appId);
-        if (localCN > state.cn) {
-            LOG("[AppState] ReleaseCloudSession app %u: local CN %llu > cloud CN %llu, reconciling file list",
-                appId, (unsigned long long)localCN, (unsigned long long)state.cn);
-            state.files.clear();
-            auto localManifest = LoadLocalManifest(accountId, appId);
-            for (const auto& [name, me] : localManifest) {
-                FileEntry fe;
-                fe.sha = me.sha;
-                fe.timestamp = me.timestamp;
-                fe.size = me.size;
-                state.files[name] = std::move(fe);
-            }
-            state.cn = localCN;
-        }
-
+        // Only release the lock; the file list and CN were already committed by the
+        // upload batch. Don't rebuild the manifest from local blobs here -- that
+        // advertises files before their blobs are durably uploaded.
         state.session = {};
-        if (!PublishCloudState(accountId, appId, state, result.etag)) {
+        if (!PublishCloudState(accountId, appId, state, /*lockOnly=*/true)) {
             LOG("[AppState] ReleaseCloudSession app %u: publish failed (best-effort)", appId);
         }
         LOG("[AppState] ReleaseCloudSession app %u: session cleared (client=%llu)",

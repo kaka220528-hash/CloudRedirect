@@ -65,7 +65,6 @@ enum class StateFetchStatus {
 struct StateFetchResult {
     StateFetchStatus status = StateFetchStatus::FetchFailed;
     CloudAppState state;
-    std::string etag; // For conditional writes (OneDrive)
 };
 
 void AppState_Init(ICloudProvider* provider);
@@ -89,10 +88,13 @@ StateFetchResult FetchCloudStateForServe(uint32_t accountId, uint32_t appId);
 // sessions as contention. See g_ownClientId in app_state.cpp.
 void NoteOwnClientId(uint64_t clientId);
 
-// If etag is non-empty, uses conditional write (OneDrive).
+// Publishes the app's cloud state. Refuses to regress the changenumber (re-fetches
+// and rejects if the provider already holds a newer CN) -- the only guard against
+// a stale RMW on providers with no conditional-write primitive.
+// lockOnly skips the blob verify/heal pass; use it only on the session-release
+// publish, where the manifest and CN were just committed by the upload batch.
 bool PublishCloudState(uint32_t accountId, uint32_t appId,
-                       const CloudAppState& state,
-                       const std::string& etag = "");
+                       const CloudAppState& state, bool lockOnly = false);
 
 std::string SerializeState(const CloudAppState& state);
 bool DeserializeState(const std::string& json, CloudAppState& outState);

@@ -9,14 +9,18 @@
 
 namespace StatsStore {
 
-// Cloud-backing provider callbacks. The store stays decoupled from the
-// platform CloudStorage / account-id plumbing: the platform layer installs
-// these so per-app stats blobs are pulled on first access and pushed on save.
-// pull: return true and fill outJson if a cloud blob exists for appId.
-// push: persist the JSON blob for appId to the cloud (fire-and-forget).
-using CloudPullFn = std::function<bool(uint32_t appId, std::string& outJson)>;
-using CloudPushFn = std::function<void(uint32_t appId, const std::string& json)>;
-void SetCloudProvider(CloudPullFn pull, CloudPushFn push);
+// Cloud-backing provider callbacks; the platform layer installs these.
+//
+// Stats sync as a single account-wide blob keyed by appId, not one blob per app
+// (which cost a Drive round-trip per app at every startup/poll, stalling launch).
+//   pullAll: fill `out` (appId -> stats JSON) from the account blob. One read.
+//   pushAll: persist the snapshot; the platform layer RMW-merges against the live
+//            blob (so another device isn't clobbered) and skips unchanged uploads.
+using CloudPullAllFn =
+    std::function<bool(std::unordered_map<uint32_t, std::string>& out)>;
+using CloudPushAllFn =
+    std::function<void(const std::unordered_map<uint32_t, std::string>& all)>;
+void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll);
 
 struct StatEntry {
     uint32_t statId;

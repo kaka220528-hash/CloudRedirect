@@ -3,12 +3,21 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace CloudIntercept {
 
 uint64_t MakeAppAccountKey(uint32_t accountId, uint32_t appId);
+
+// SHA/size/timestamp captured from the exact bytes received at CommitFileUpload,
+// so CompleteBatch publishes what was uploaded rather than re-stat'ing disk.
+struct UploadFileMeta {
+    std::vector<uint8_t> sha;   // SHA-1 over the uploaded bytes
+    uint64_t size = 0;
+    uint64_t timestamp = 0;
+};
 
 struct UploadBatchState {
     uint64_t batchId = 0;
@@ -17,6 +26,7 @@ struct UploadBatchState {
     std::unordered_set<std::string> uploads;
     std::unordered_set<std::string> deletes;
     std::unordered_map<std::string, uint32_t> filePlatforms; // filename -> platforms_to_sync
+    std::unordered_map<std::string, UploadFileMeta> uploadMeta; // filename -> uploaded sha/size/ts
 };
 
 // Allocate the next unique batch ID (monotonic per process).
@@ -28,9 +38,13 @@ uint64_t BatchTracker_ActiveId(uint32_t accountId, uint32_t appId);
 // Create a new batch for this (account, app) with the given batch ID.
 void BatchTracker_Begin(uint32_t accountId, uint32_t appId, uint64_t batchId, uint64_t assignedCN, uint64_t appBuildId);
 
-// Record a file upload or delete in the active batch.  No-op if no active batch.
+// Record a file upload in the active batch with the uploaded bytes' SHA/size/ts.
+// No-op if no active batch.
 void BatchTracker_RecordUpload(uint32_t accountId, uint32_t appId,
-                               const std::string& filename);
+                               const std::string& filename,
+                               const std::vector<uint8_t>& sha,
+                               uint64_t size, uint64_t timestamp);
+// Record a file delete in the active batch.  No-op if no active batch.
 void BatchTracker_RecordDelete(uint32_t accountId, uint32_t appId,
                                const std::string& filename);
 

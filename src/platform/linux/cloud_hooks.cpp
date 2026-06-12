@@ -351,24 +351,62 @@ static void EnsureInitialized() {
         PendingOpsJournal::Init(storageRoot);
         HttpServer::Start(storageRoot, CloudIntercept::GetAccountId());
 
-        // Native stats / playtime store (cloud-backed). Per-app stats blobs ride
-        // each app's Steam Cloud sync, same as the CN/root-token metadata blobs.
+        // Stats sync as one account-wide blob at <accountId>/0/stats.json (appId ->
+        // stats JSON), not one blob per app (a Drive round-trip per app at startup).
         StatsStore::SetCloudProvider(
-            [](uint32_t appId, std::string& outJson) -> bool {
+            // pullAll: one download of the account blob, split into per-app entries.
+            [](std::unordered_map<uint32_t, std::string>& out) -> bool {
                 uint32_t accountId = CloudIntercept::GetAccountId();
                 if (accountId == 0) return false;
                 std::vector<uint8_t> data;
                 if (!CloudStorage::DownloadCloudMetadataWithLegacyFallback(
-                        accountId, appId, "stats.json", nullptr, data) || data.empty())
-                    return false;
-                outJson.assign(reinterpret_cast<const char*>(data.data()), data.size());
+                        accountId, CloudIntercept::kAccountScopeAppId, "stats.json",
+                        nullptr, data) || data.empty())
+                    return true;  // no account blob yet -> empty (not a failure)
+                Json::Value root = Json::Parse(
+                    std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+                if (root.type != Json::Type::Object) return true;
+                for (const auto& [appIdStr, appVal] : root.objVal) {
+                    uint32_t appId = (uint32_t)strtoul(appIdStr.c_str(), nullptr, 10);
+                    if (appId == 0) continue;
+                    out[appId] = Json::Stringify(appVal);
+                }
                 return true;
             },
-            [](uint32_t appId, const std::string& json) {
+            // pushAll: RMW-merge our snapshot onto the live blob (don't clobber
+            // another device) and upload once; skip if nothing changed.
+            [](const std::unordered_map<uint32_t, std::string>& all) {
                 uint32_t accountId = CloudIntercept::GetAccountId();
                 if (accountId == 0) return;
-                // Queued: serializes on the cloud work queue (safe from any thread).
-                CloudStorage::UploadCloudMetadataTextAsync(accountId, appId, "stats.json", json);
+
+                Json::Value root = Json::Object();
+                std::vector<uint8_t> cur;
+                if (CloudStorage::DownloadCloudMetadataWithLegacyFallback(
+                        accountId, CloudIntercept::kAccountScopeAppId, "stats.json",
+                        nullptr, cur) && !cur.empty()) {
+                    Json::Value parsed = Json::Parse(
+                        std::string(reinterpret_cast<const char*>(cur.data()), cur.size()));
+                    if (parsed.type == Json::Type::Object) root = std::move(parsed);
+                }
+
+                bool changed = false;
+                for (const auto& [appId, json] : all) {
+                    if (appId == 0) continue;
+                    std::string key = std::to_string(appId);
+                    Json::Value appVal = Json::Parse(json);
+                    std::string existing = root.has(key)
+                        ? Json::Stringify(root.objVal[key]) : std::string();
+                    std::string updated = Json::Stringify(appVal);
+                    if (existing != updated) {
+                        root.objVal[key] = std::move(appVal);
+                        changed = true;
+                    }
+                }
+                if (!changed) return;
+
+                std::string merged = Json::Stringify(root);
+                CloudStorage::UploadCloudMetadataTextAsync(
+                    accountId, CloudIntercept::kAccountScopeAppId, "stats.json", merged);
             });
         // Track playtime/stats for namespace (lua) apps only -- real owned games
         // must never have their playtime recorded or synced.

@@ -92,20 +92,34 @@ inline bool IsSafeRelativePath(const std::string& path) {
 
 // Filesystem time conversion
 
+// Convert a filesystem mtime to whole Unix seconds, rounded to nearest. Flooring
+// recorded a time_stamp one second below the mtime Steam reads off the same file,
+// so the sync-state eval saw the local copy as newer and showed a wrong arrow.
 inline uint64_t FileTimeToUnixSeconds(std::filesystem::file_time_type ftime) {
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+    auto sysTime = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+#else
+    // Pre-C++20: paired clock reads back-to-back to keep epoch jitter sub-second.
     auto fileNow = std::filesystem::file_time_type::clock::now();
-    auto sysNow = std::chrono::system_clock::now();
-    auto sctp = std::chrono::time_point_cast<std::chrono::seconds>(
-        ftime - fileNow + sysNow
-    );
-    return (uint64_t)sctp.time_since_epoch().count();
+    auto sysNow  = std::chrono::system_clock::now();
+    auto sysTime = sysNow + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+        ftime - fileNow);
+#endif
+    auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        sysTime.time_since_epoch()).count();
+    return (uint64_t)((secs + 500) / 1000);
 }
 
 inline std::filesystem::file_time_type UnixSecondsToFileTime(uint64_t unixSeconds) {
     auto sysTime = std::chrono::system_clock::from_time_t((time_t)unixSeconds);
-    auto sysNow = std::chrono::system_clock::now();
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+    return std::chrono::clock_cast<std::filesystem::file_time_type::clock>(sysTime);
+#else
+    auto sysNow  = std::chrono::system_clock::now();
     auto fileNow = std::filesystem::file_time_type::clock::now();
-    return fileNow + (sysTime - sysNow);
+    return fileNow + std::chrono::duration_cast<std::filesystem::file_time_type::duration>(
+        sysTime - sysNow);
+#endif
 }
 
 // Platform-specific path resolution

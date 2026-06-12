@@ -1269,27 +1269,24 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
 
     // CAS: resolve filename->SHA, download by SHA.
     if (cloudActive) {
-        // Local manifest is only a cache; on a fresh machine it's empty, so SHA
-        // resolution must fall back to authoritative cloud state. Priority order:
-        // local manifest -> cloud state -> caller's expectedShaHex (also cloud-derived).
-        Manifest manifest = LoadLocalManifest(accountId, appId);
-        auto mit = manifest.find(filename);
+        // Prefer the SHA from cloud state (the record the changelist served Steam);
+        // the local manifest is a cache and goes stale before a download. Priority:
+        // cloud state -> local manifest (offline) -> caller's expectedShaHex.
         std::string shaHex;
-        if (mit != manifest.end() && !mit->second.sha.empty()) {
-            shaHex = ShaToHex(mit->second.sha);
+        auto cloud = FetchCloudStateForServe(accountId, appId);
+        if (cloud.status == StateFetchStatus::Ok) {
+            auto cit = cloud.state.files.find(filename);
+            if (cit != cloud.state.files.end() && !cit->second.sha.empty())
+                shaHex = ShaToHex(cit->second.sha);
         }
         if (shaHex.empty()) {
-            // Local cache miss -> consult the authoritative cloud state. Serve
-            // path: use the cache-aware accessor (faithful to a single restore
-            // burst snapshot; falls back to live when stale or under contention).
-            auto cloud = FetchCloudStateForServe(accountId, appId);
-            if (cloud.status == StateFetchStatus::Ok) {
-                auto cit = cloud.state.files.find(filename);
-                if (cit != cloud.state.files.end() && !cit->second.sha.empty()) {
-                    shaHex = ShaToHex(cit->second.sha);
-                    LOG("[CloudStorage] RetrieveBlob: resolved SHA from cloud state for %s (local manifest miss)",
-                        filename.c_str());
-                }
+            // Cloud state unavailable -> fall back to the local manifest cache.
+            Manifest manifest = LoadLocalManifest(accountId, appId);
+            auto mit = manifest.find(filename);
+            if (mit != manifest.end() && !mit->second.sha.empty()) {
+                shaHex = ShaToHex(mit->second.sha);
+                LOG("[CloudStorage] RetrieveBlob: cloud state unavailable, using local manifest SHA for %s",
+                    filename.c_str());
             }
         }
         if (shaHex.empty() && !expectedShaHex.empty()) {
@@ -1497,21 +1494,23 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
             }
         }
 
-        // Cloud failed -- fall back to local cache if SHA matches.
+        // Cloud failed -- fall back to the local cache only if its SHA matches what
+        // the server published. Serving mismatched bytes would look synced but be
+        // stale, so prefer failing the download (Steam retries) over that.
         std::vector<uint8_t> cached;
         if (TryReadCachedBlob(localPath, filename, cached)) {
-            if (mit != manifest.end() && !mit->second.sha.empty()) {
-                auto cachedSha = FileUtil::SHA1(cached.data(), cached.size());
-                if (cachedSha == mit->second.sha) {
+            if (!shaHex.empty()) {
+                auto cachedSha = ShaToHex(FileUtil::SHA1(cached.data(), cached.size()));
+                if (cachedSha == shaHex) {
                     LOG("[CloudStorage] RetrieveBlob: cloud unavailable, cache SHA valid: %s (%zu bytes)",
                         filename.c_str(), cached.size());
                     if (found) *found = true;
                     return cached;
                 }
-                LOG("[CloudStorage] RetrieveBlob: cloud unavailable, cache SHA MISMATCH: %s",
-                    filename.c_str());
+                LOG("[CloudStorage] RetrieveBlob: cloud unavailable, cache SHA MISMATCH (have %s, need %s): %s -- not serving stale",
+                    cachedSha.c_str(), shaHex.c_str(), filename.c_str());
             } else {
-                LOG("[CloudStorage] RetrieveBlob: cloud unavailable, no manifest SHA for %s, serving cached (%zu bytes)",
+                LOG("[CloudStorage] RetrieveBlob: cloud unavailable, no authoritative SHA for %s, serving cached (%zu bytes)",
                     filename.c_str(), cached.size());
                 if (found) *found = true;
                 return cached;
@@ -1573,6 +1572,96 @@ bool DeleteBlobStaged(uint32_t accountId, uint32_t appId,
 
     // CN is incremented once per batch in HandleCompleteBatch, not per file.
 
+    return true;
+}
+
+// Ensure every file in `state` has its blob durable on the provider before the
+// manifest is published: re-upload from the local cache (heal) or drop the entry
+// (forget) rather than advertise a blob that 404s elsewhere. Returns false only
+// when the cloud listing is unavailable (can't tell durable from phantom).
+bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
+                                     CloudAppState& state) {
+    if (state.files.empty()) return true;
+
+    InflightSyncScope guard;
+    if (!guard) return true;                 // shutting down: leave state untouched
+    if (!g_provider || !g_provider->IsAuthenticated())
+        return true;                         // local-only: nothing to verify against
+
+    // Account-scope metadata is filename-addressed, not CAS; skip.
+    if (appId == CloudIntercept::kAccountScopeAppId) return true;
+
+    std::string blobPrefix = std::to_string(accountId) + "/" +
+                             std::to_string(appId) + "/blobs/";
+    std::vector<ICloudProvider::FileInfo> remoteBlobs;
+    bool complete = false;
+    if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
+        LOG("[CloudStorage] VerifyManifest app %u: blob listing unavailable; not publishing",
+            appId);
+        return false;
+    }
+
+    // Build the set of SHAs and legacy paths actually present on the provider.
+    auto isHexSha = [](const std::string& s) {
+        return s.size() == 40 &&
+               s.find_first_not_of("0123456789abcdef") == std::string::npos;
+    };
+    std::unordered_set<std::string> cloudShas;        // sha hex present (canonical or legacy CAS)
+    std::unordered_set<std::string> cloudFilenames;   // legacy filename-addressed blobs present
+    for (const auto& fi : remoteBlobs) {
+        if (fi.path.size() <= blobPrefix.size()) continue;
+        std::string rel = fi.path.substr(blobPrefix.size());
+        size_t lastSlash = rel.rfind('/');
+        if (lastSlash != std::string::npos && isHexSha(rel.substr(lastSlash + 1))) {
+            cloudShas.insert(rel.substr(lastSlash + 1));         // canonical filename/sha
+        } else if (isHexSha(rel)) {
+            cloudShas.insert(rel);                               // legacy blobs/sha
+        } else {
+            cloudFilenames.insert(rel);                          // legacy blobs/filename
+        }
+    }
+
+    std::vector<std::string> healed, dropped;
+    for (auto it = state.files.begin(); it != state.files.end(); ) {
+        const std::string& filename = it->first;
+        const FileEntry& fe = it->second;
+
+        std::string shaHex = fe.sha.empty() ? std::string() : ShaToHex(fe.sha);
+        bool present = (!shaHex.empty() && cloudShas.count(shaHex) > 0) ||
+                       cloudFilenames.count(filename) > 0;
+        if (present) { ++it; continue; }
+
+        // Blob missing on cloud. Heal from the local cache only if it still hashes
+        // to the entry's SHA; otherwise it diverged, so drop the entry.
+        if (!shaHex.empty()) {
+            std::vector<uint8_t> local = LocalStorage::ReadFile(accountId, appId, filename);
+            bool localMatches = (ShaToHex(FileUtil::SHA1(local.data(), local.size())) == shaHex);
+            if (localMatches) {
+                ICloudProvider::UploadItem item;
+                item.path = CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex);
+                item.data = std::move(local);
+                std::vector<ICloudProvider::UploadItem> one;
+                one.push_back(std::move(item));
+                if (g_provider->UploadBatch(one)) {
+                    healed.push_back(filename);
+                    ++it;
+                    continue;
+                }
+                LOG("[CloudStorage] VerifyManifest app %u: heal upload failed for %s",
+                    appId, filename.c_str());
+                // Upload failed -> not durable; drop so we never advertise it.
+            }
+        }
+
+        dropped.push_back(filename);
+        it = state.files.erase(it);
+    }
+
+    if (!healed.empty() || !dropped.empty()) {
+        InvalidateBlobIndex(accountId, appId);
+        LOG("[CloudStorage] VerifyManifest app %u: healed %zu, dropped %zu phantom file(s)",
+            appId, healed.size(), dropped.size());
+    }
     return true;
 }
 

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -33,6 +34,7 @@ typedef int CURLoption;
 #define CURLOPT_HEADERDATA     10029
 #define CURLINFO_RESPONSE_CODE 0x200002
 
+typedef int  (*curl_global_init_fn)(long);
 typedef CURL* (*curl_easy_init_fn)(void);
 typedef CURLcode (*curl_easy_setopt_fn)(CURL*, CURLoption, ...);
 typedef CURLcode (*curl_easy_perform_fn)(CURL*);
@@ -41,8 +43,11 @@ typedef void (*curl_easy_cleanup_fn)(CURL*);
 typedef struct curl_slist* (*curl_slist_append_fn)(struct curl_slist*, const char*);
 typedef void (*curl_slist_free_all_fn)(struct curl_slist*);
 
+#define CURL_GLOBAL_ALL 3  // CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32
+
 struct CurlAPI {
     void* handle = nullptr;
+    curl_global_init_fn global_init = nullptr;
     curl_easy_init_fn easy_init = nullptr;
     curl_easy_setopt_fn easy_setopt = nullptr;
     curl_easy_perform_fn easy_perform = nullptr;
@@ -54,8 +59,20 @@ struct CurlAPI {
 
 static CurlAPI g_curl{};
 static bool g_curlInitAttempted = false;
+static std::mutex g_curlInitMutex;
+
+// Steam's bundled 32-bit libcurl has a non-thread-safe curl_easy_init/cleanup
+// pair: two threads creating handles concurrently race the shared SSL tables and
+// segfault in curl_easy_init. global_init under a mutex isn't enough -- the
+// handle lifecycle must be serialized too. perform is safe per-handle, so we
+// guard only init + cleanup.
+static std::mutex g_curlHandleMutex;
 
 static bool InitCurl() {
+    // Serialize init and call curl_global_init() explicitly here -- libcurl's lazy
+    // global init off the first curl_easy_init isn't thread-safe and crashed when
+    // EndSession raced a background worker.
+    std::lock_guard<std::mutex> lock(g_curlInitMutex);
     if (g_curlInitAttempted) return g_curl.handle != nullptr;
     g_curlInitAttempted = true;
 
@@ -87,6 +104,7 @@ static bool InitCurl() {
         return false;
     }
 
+    g_curl.global_init  = (curl_global_init_fn)dlsym(g_curl.handle, "curl_global_init");
     g_curl.easy_init    = (curl_easy_init_fn)dlsym(g_curl.handle, "curl_easy_init");
     g_curl.easy_setopt  = (curl_easy_setopt_fn)dlsym(g_curl.handle, "curl_easy_setopt");
     g_curl.easy_perform = (curl_easy_perform_fn)dlsym(g_curl.handle, "curl_easy_perform");
@@ -101,6 +119,15 @@ static bool InitCurl() {
         dlclose(g_curl.handle);
         g_curl.handle = nullptr;
         return false;
+    }
+
+    // Explicit global init (once, under the mutex) -- required before any
+    // curl_easy_init and must not be left to libcurl's non-thread-safe lazy path.
+    if (g_curl.global_init) {
+        g_curl.global_init(CURL_GLOBAL_ALL);
+        LOG("[HTTP] curl_global_init done");
+    } else {
+        LOG("[HTTP] WARNING: curl_global_init symbol missing; relying on lazy init");
     }
 
     return true;
@@ -157,7 +184,11 @@ static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
         else safeUrl += c;
     }
 
-    CURL* curl = g_curl.easy_init();
+    CURL* curl;
+    {
+        std::lock_guard<std::mutex> lock(g_curlHandleMutex);
+        curl = g_curl.easy_init();
+    }
     if (!curl) return resp;
 
     std::string responseBody;
@@ -198,7 +229,10 @@ static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
     g_curl.easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
     if (slist && g_curl.slist_free_all) g_curl.slist_free_all(slist);
-    g_curl.easy_cleanup(curl);
+    {
+        std::lock_guard<std::mutex> lock(g_curlHandleMutex);
+        g_curl.easy_cleanup(curl);
+    }
 
     if (res != 0) {
         LOG("%s curl failed: %d (%s %s)", logTag, res, method, url.c_str());

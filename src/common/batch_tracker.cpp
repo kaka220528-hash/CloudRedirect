@@ -39,13 +39,16 @@ void BatchTracker_Begin(uint32_t accountId, uint32_t appId, uint64_t batchId, ui
 }
 
 void BatchTracker_RecordUpload(uint32_t accountId, uint32_t appId,
-                               const std::string& filename) {
+                               const std::string& filename,
+                               const std::vector<uint8_t>& sha,
+                               uint64_t size, uint64_t timestamp) {
     uint64_t key = MakeAppAccountKey(accountId, appId);
     std::lock_guard<std::mutex> lock(g_uploadBatchMutex);
     auto it = g_activeUploadBatches.find(key);
     if (it == g_activeUploadBatches.end()) return;
     it->second.deletes.erase(filename);
     it->second.uploads.insert(filename);
+    it->second.uploadMeta[filename] = { sha, size, timestamp };
 }
 
 void BatchTracker_RecordDelete(uint32_t accountId, uint32_t appId,

@@ -569,7 +569,6 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     uint64_t appBuildIdHwm = 0;
     CloudStorage::CloudAppState fetchedState; // retained for quota caching
     bool haveFetchedState = false;
-    bool cloudStateNotFound = false; // true ONLY on genuine NotFound (not fetch error)
 
     if (CloudStorage::IsCloudActive()) {
         SetRpcCrashContext("GetChangelist:fetch-cloud", "Cloud.GetAppFileChangelist#1", appId);
@@ -590,18 +589,12 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             fetchedState = state;
             haveFetchedState = true;
 
-            uint64_t localCN = LocalStorage::GetChangeNumber(accountId, appId);
-            if (state.cn > localCN) {
-                LOG("[NS-CL] GetAppFileChangelist app=%u: cloud CN=%llu > local CN=%llu, syncing local",
-                    appId, state.cn, localCN);
-                CloudStorage::SaveManifestLocal(accountId, appId, cloudManifest);
-                LocalStorage::SetChangeNumber(accountId, appId, state.cn);
-            }
-
+            // Read-only: serve cloud state, don't advance localCN. Adopting it before
+            // the blobs are on disk would make a later sweep think we're in sync and
+            // skip downloads. SyncFromCloud advances localCN once blobs are durable.
             LOG("[NS-CL] GetAppFileChangelist app=%u: cloud state CN=%llu (%zu files)",
                 appId, cloudCN, cloudManifest.size());
         } else if (stateResult.status == CloudStorage::StateFetchStatus::NotFound) {
-            cloudStateNotFound = true;
             LOG("[NS-CL] GetAppFileChangelist app=%u: no cloud state (new app), using local",
                 appId);
         } else {
@@ -633,85 +626,9 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             appId, cloudCN, cloudManifest.size());
     }
 
-    // Reconciliation safety net: if our local blob store contains non-reserved
-    // files the REAL cloud manifest is missing, publish a MERGED manifest at a
-    // non-rewinding CN. Native upload (CompleteBatch) is the primary publisher;
-    // this catches the case where blobs exist locally but cloud state was lost
-    // and no new upload has happened yet. Publishes at strictly-above-cloud CN so
-    // it can never rewind (issue #53 was caused by the old AutoCloud bootstrap
-    // publishing a stale CN; that component has been removed entirely).
-    // Only reconcile when we KNOW the real cloud contents: either a successful
-    // fetch (haveFetchedState) or a definitive NotFound (empty cloud). NEVER on a
-    // transient fetch failure -- treating that as "empty" could republish over
-    // good cloud state during a network blip.
-    if (CloudStorage::IsCloudActive() && (haveFetchedState || cloudStateNotFound)) {
-        SetRpcCrashContext("GetChangelist:reconcile-local", "Cloud.GetAppFileChangelist#1", appId);
-        CloudStorage::Manifest localBlobs =
-            CloudStorage::BuildManifestFromLocalBlobs(accountId, appId);
-
-        // Compare against the REAL cloud manifest only. cloudManifest/cloudCN may
-        // have been pre-filled from the local-fallback path above (when no cloud
-        // state exists), which would mask missing files. cloudFileEntries is
-        // populated ONLY by an actual cloud fetch (haveFetchedState), so use it as
-        // the authoritative "what's really in the cloud" set. NotFound -> empty.
-        static const std::unordered_map<std::string, CloudStorage::FileEntry> kEmptyCloudFiles;
-        const auto& realCloudFiles = haveFetchedState ? cloudFileEntries : kEmptyCloudFiles;
-
-        size_t missingFromCloud = 0;
-        for (const auto& [name, entry] : localBlobs) {
-            if (IsReservedBlobFilename(name)) continue;
-            if (realCloudFiles.find(name) == realCloudFiles.end()) ++missingFromCloud;
-        }
-
-        if (missingFromCloud > 0) {
-            // Merge: start from real cloud files, add/refresh from local blobs.
-            CloudStorage::CloudAppState mergedState;
-            for (const auto& [name, fe] : realCloudFiles) {
-                if (IsReservedBlobFilename(name)) continue;
-                mergedState.files[name] = fe;
-            }
-            for (const auto& [name, me] : localBlobs) {
-                if (IsReservedBlobFilename(name)) continue;
-                CloudStorage::FileEntry fe;
-                fe.sha = me.sha;
-                fe.timestamp = me.timestamp;
-                fe.size = me.size;
-                mergedState.files[name] = std::move(fe);
-            }
-            uint64_t baseCN = cloudCN > LocalStorage::GetChangeNumber(accountId, appId)
-                                  ? cloudCN
-                                  : LocalStorage::GetChangeNumber(accountId, appId);
-            mergedState.cn = baseCN + 1; // strictly above any seen CN -> never rewinds
-            mergedState.appBuildId = appBuildIdHwm;
-
-            LOG("[NS-CL] Reconcile app %u: %zu local file(s) missing from cloud; "
-                "publishing merged manifest (%zu files) at CN=%llu",
-                appId, missingFromCloud, mergedState.files.size(),
-                (unsigned long long)mergedState.cn);
-
-            auto statePtr = std::make_shared<CloudStorage::CloudAppState>(std::move(mergedState));
-            uint32_t asyncAcct = accountId;
-            uint32_t asyncApp = appId;
-            std::thread([statePtr, asyncAcct, asyncApp] {
-                CloudStorage::InflightSyncScope guard;
-                if (!guard.entered) return;
-                auto syncMtx = CloudStorage::AcquireAppSyncMutex(asyncAcct, asyncApp);
-                std::lock_guard<std::mutex> lock(*syncMtx);
-                // Re-fetch under lock; recompute CN above the freshest cloud CN so
-                // a concurrent native publish can't be rewound.
-                auto existing = CloudStorage::FetchCloudState(asyncAcct, asyncApp);
-                if (existing.status == CloudStorage::StateFetchStatus::Ok) {
-                    if (existing.state.cn >= statePtr->cn) {
-                        statePtr->cn = existing.state.cn + 1;
-                    }
-                    // Don't clobber an active session lock.
-                    statePtr->session = existing.state.session;
-                }
-                CloudStorage::PublishCloudState(asyncAcct, asyncApp, *statePtr);
-                LocalStorage::SetChangeNumber(asyncAcct, asyncApp, statePtr->cn);
-            }).detach();
-        }
-    }
+    // Answer with real cloud state and let Steam drive uploads via its own
+    // BeginBatch/CompleteBatch. Reconciling a merged manifest from local blobs here
+    // advertised files before their blobs were durable -- the phantom-manifest bug.
 
     // Build file list - either from cloud manifest (fast path) or local blobs
     std::vector<LocalStorage::FileEntry> files;
@@ -1182,11 +1099,8 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
                 state.session.machineName = currentSession.machineName;
                 state.session.timeLastUpdated = now;
                 state.session.operation = "active";
-                if (!CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag)) {
-                    // Retry once without etag.
-                    if (!CloudStorage::PublishCloudState(accountId, appId, state)) {
-                        LOG("[NS] LaunchIntent app=%u: session override publish failed after retry", appId);
-                    }
+                if (!CloudStorage::PublishCloudState(accountId, appId, state)) {
+                    LOG("[NS] LaunchIntent app=%u: session override publish failed", appId);
                 }
                 LOG("[NS] LaunchIntent app=%u: forced session override (machine=%s, client=%llu)",
                     appId, currentSession.machineName.c_str(), currentSession.clientId);
@@ -1196,9 +1110,11 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
             state.session.machineName = currentSession.machineName;
             state.session.timeLastUpdated = now;
             state.session.operation = "active";
-            if (!CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag)) {
-                // Retry without etag (stale from racing ReleaseCloudSession).
-                LOG("[NS] LaunchIntent app=%u: session acquire publish failed, retrying without etag", appId);
+            if (!CloudStorage::PublishCloudState(accountId, appId, state)) {
+                // Publish refused/failed -- typically the CN-monotonic guard saw a
+                // newer cloud state (another machine published in the window).
+                // Re-fetch the fresh state and re-apply our session onto it.
+                LOG("[NS] LaunchIntent app=%u: session acquire publish failed, re-fetching to reconcile", appId);
                 auto freshResult = CloudStorage::FetchCloudState(accountId, appId);
                 if (freshResult.status == CloudStorage::StateFetchStatus::Ok) {
                     auto& freshState = freshResult.state;
@@ -1341,8 +1257,17 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
         return RpcResult(PB::Writer(), kEResultFail);
     }
 
-    uint64_t currentCN = LocalStorage::GetChangeNumber(accountId, appId);
-    uint64_t assignedCN = currentCN + 1;
+    // The CN returned here is what Steam records as synced and what we must publish
+    // at CompleteBatch -- they have to match, or Steam re-downloads what it just
+    // uploaded. Assign max(local, cloud)+1, strictly above whatever the cloud holds.
+    uint64_t localCN = LocalStorage::GetChangeNumber(accountId, appId);
+    uint64_t cloudCN = 0;
+    if (CloudStorage::IsCloudActive()) {
+        auto cloud = CloudStorage::FetchCloudStateForServe(accountId, appId);
+        if (cloud.status == CloudStorage::StateFetchStatus::Ok)
+            cloudCN = cloud.state.cn;
+    }
+    uint64_t assignedCN = (std::max)(localCN, cloudCN) + 1;
     uint64_t appBuildId = 0;
     PrepareBatchCanonicalTokens(accountId, appId);
     PendingOpsJournal::RecordUploadBatchStart(accountId, appId);
@@ -1523,6 +1448,29 @@ RpcResult HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& r
             auto blobData = HttpServer::ReadBlob(accountId, appId, cleanName);
             LOG("[NS-UP]   committed: %s (%zu bytes)", cleanName.c_str(), blobData.size());
 
+            // Hash the exact bytes uploaded for the manifest; re-stat'ing the disk
+            // file at CompleteBatch can race a write and publish a mismatched SHA.
+            std::vector<uint8_t> uploadedSha =
+                FileUtil::SHA1(blobData.data(), blobData.size());
+            uint64_t uploadedSize = blobData.size();
+
+            // Record the file mtime so a peer's localtime matches our remotetime
+            // (native keeps remotetime == time); else the eval shows a wrong arrow.
+            // The commit RPC has only the filename, so when the file isn't in our
+            // mirror, round the wall clock instead of flooring time(nullptr).
+            uint64_t uploadedTs = 0;
+            if (auto e = LocalStorage::GetFileEntry(accountId, appId, cleanName)) {
+                uploadedTs = e->timestamp;
+            } else {
+                struct timespec ts_now;
+                if (timespec_get(&ts_now, TIME_UTC) == TIME_UTC)
+                    uploadedTs = (uint64_t)(ts_now.tv_sec + (ts_now.tv_nsec >= 500000000L ? 1 : 0));
+                else
+                    uploadedTs = (uint64_t)time(nullptr);
+                LOG("[NS-UP]   note: no cached mtime for %s; recording wall-clock ts=%llu",
+                    cleanName.c_str(), (unsigned long long)uploadedTs);
+            }
+
             {
                 const uint8_t* blobPtr = blobData.empty() ? nullptr : blobData.data();
                 uint64_t batchId = BatchTracker_ActiveId(accountId, appId);
@@ -1537,11 +1485,10 @@ RpcResult HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& r
                     committed = false;
                     HttpServer::DeleteBlob(accountId, appId, cleanName);
                 } else if (!isStaged) {
-                    auto entry = LocalStorage::GetFileEntry(accountId, appId, cleanName);
-                    if (entry) {
-                        CloudStorage::UpdateManifestEntry(accountId, appId, cleanName,
-                            entry->sha, entry->timestamp, entry->rawSize);
-                    }
+                    // Non-batch path: update the manifest with the uploaded bytes'
+                    // SHA/size directly (not a disk re-read).
+                    CloudStorage::UpdateManifestEntry(accountId, appId, cleanName,
+                        uploadedSha, uploadedTs, uploadedSize);
                 }
             }
 
@@ -1549,7 +1496,8 @@ RpcResult HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& r
                 if (RecordFileToken(accountId, appId, cleanName, rootToken)) {
                     MarkFileTokensDirty(accountId, appId);
                 }
-                BatchTracker_RecordUpload(accountId, appId, cleanName);
+                BatchTracker_RecordUpload(accountId, appId, cleanName,
+                                          uploadedSha, uploadedSize, uploadedTs);
             }
         } else {
             LOG("[NS-UP]   WARNING: blob not found after PUT for %s (clean=%s)", filename.c_str(), cleanName.c_str());
@@ -1803,8 +1751,22 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
                 haveCloudBase = true;
             }
         }
-        // If cloud CN is behind local, rebuild file list from manifest (keep session/quota).
+        // Publish at exactly the CN we gave Steam at BeginBatch. If the cloud
+        // advanced past it since (another device uploaded in the window), refuse the
+        // commit rather than bump to a CN Steam doesn't know, and let Steam re-sync.
         uint64_t localCN = LocalStorage::GetChangeNumber(accountId, appId);
+        if (haveCloudBase && state.cn >= newCN) {
+            LOG("[NS] CompleteBatch app %u: cloud CN %llu advanced to/past assignedCN %llu since "
+                "BeginBatch (concurrent update); refusing commit so Steam re-syncs",
+                appId, (unsigned long long)state.cn, (unsigned long long)newCN);
+            PendingOpsJournal::RecordUploadBatchInterrupted(accountId, appId);
+            BatchTracker_Clear(accountId, appId, batch.batchId);
+            ClearFileTokensDirty(accountId, appId);
+            ClearBatchCanonicalTokens(accountId, appId);
+            return PB::Writer();
+        }
+
+        // If cloud CN is behind local, rebuild file list from manifest (keep session/quota).
         if (!haveCloudBase || state.cn < localCN) {
             if (haveCloudBase && state.cn < localCN) {
                 LOG("[NS] CompleteBatch app %u: cloud CN %llu < local CN %llu, rebuilding file list from local manifest",
@@ -1826,12 +1788,23 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
 
         for (const auto& filename : uploads) {
             if (IsReservedBlobFilename(filename)) continue;
-            auto entry = LocalStorage::GetFileEntry(accountId, appId, filename);
-            if (!entry.has_value()) continue;
             CloudStorage::FileEntry fe;
-            fe.sha = entry->sha;
-            fe.timestamp = entry->timestamp;
-            fe.size = entry->rawSize;
+            // Prefer the SHA/size captured at CommitFileUpload; re-stat'ing disk here
+            // can read a racing file and publish a SHA that doesn't match the blob.
+            auto metaIt = batch.uploadMeta.find(filename);
+            if (metaIt != batch.uploadMeta.end()) {
+                fe.sha = metaIt->second.sha;
+                fe.timestamp = metaIt->second.timestamp;
+                fe.size = metaIt->second.size;
+            } else {
+                // No recorded upload meta (shouldn't happen for a real upload);
+                // fall back to disk so we don't silently drop the entry.
+                auto entry = LocalStorage::GetFileEntry(accountId, appId, filename);
+                if (!entry.has_value()) continue;
+                fe.sha = entry->sha;
+                fe.timestamp = entry->timestamp;
+                fe.size = entry->rawSize;
+            }
             auto ptIt = batch.filePlatforms.find(filename);
             fe.platformsToSync = (ptIt != batch.filePlatforms.end())
                 ? ptIt->second : 0xFFFFFFFFu;
@@ -2000,44 +1973,41 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
     uint64_t fileSize = 0;    uint64_t timestamp = 0;
     std::vector<uint8_t> sha;
 
-    // Check local manifest FIRST - this is saved from cloud during GetChangelist
-    // and represents what we told Steam the file looks like. Must match what we serve.
-    auto manifest = CloudStorage::LoadLocalManifest(accountId, appId);
-    auto it = manifest.find(cleanName);
-    if (it != manifest.end()) {
-        fileSize = it->second.size;
-        timestamp = it->second.timestamp;
-        sha = it->second.sha;
-    } else {
-        // Fallback: check local storage (for files uploaded locally but not yet in manifest)
+    // Use the SHA from cloud state -- the record the changelist served Steam. The
+    // local manifest cache is stale on a device that hasn't downloaded the newer
+    // version, so serving its SHA would point at a blob that no longer exists.
+    auto cloud = CloudStorage::FetchCloudStateForServe(accountId, appId);
+    if (cloud.status == CloudStorage::StateFetchStatus::Ok) {
+        auto cit = cloud.state.files.find(cleanName);
+        if (cit != cloud.state.files.end() && !cit->second.sha.empty()) {
+            fileSize = cit->second.size;
+            timestamp = cit->second.timestamp;
+            sha = cit->second.sha;
+        }
+    }
+
+    // Fallbacks only when cloud state is unavailable (offline / not-yet-published
+    // local upload). Local manifest cache, then a direct disk stat.
+    if (sha.empty()) {
+        auto manifest = CloudStorage::LoadLocalManifest(accountId, appId);
+        auto it = manifest.find(cleanName);
+        if (it != manifest.end()) {
+            fileSize = it->second.size;
+            timestamp = it->second.timestamp;
+            sha = it->second.sha;
+        }
+    }
+    if (sha.empty()) {
         auto entry = LocalStorage::GetFileEntry(accountId, appId, cleanName);
         if (entry) {
             fileSize = entry->rawSize;
             timestamp = entry->timestamp;
             sha = entry->sha;
-        } else {
-            // The local manifest is only a CACHE -- empty on a fresh machine (new
-            // install, post-wipe, 2nd device). The download response MUST carry the
-            // SHA/size or Steam rejects the downloaded file ("Download Failure"
-            // after a successful HTTP transfer). Resolve from the authoritative
-            // cloud state, same as RetrieveBlob does. Without this, multi-device /
-            // fresh-install downloads fail. Serve path -> cache-aware accessor.
-            auto cloud = CloudStorage::FetchCloudStateForServe(accountId, appId);
-            if (cloud.status == CloudStorage::StateFetchStatus::Ok) {
-                auto cit = cloud.state.files.find(cleanName);
-                if (cit != cloud.state.files.end() && !cit->second.sha.empty()) {
-                    fileSize = cit->second.size;
-                    timestamp = cit->second.timestamp;
-                    sha = cit->second.sha;
-                    LOG("[NS-DL] FileDownload app=%u: resolved SHA/size from cloud state for %s (local manifest miss)",
-                        appId, cleanName.c_str());
-                }
-            }
-            // Last resort: blob size on disk (no SHA available).
-            if (sha.empty())
-                fileSize = HttpServer::GetBlobSize(accountId, appId, cleanName);
         }
     }
+    // Last resort: blob size on disk (no SHA available).
+    if (sha.empty())
+        fileSize = HttpServer::GetBlobSize(accountId, appId, cleanName);
 
     LOG("[NS-DL] FileDownload app=%u file=%s (clean=%s) size=%llu -> %s%s",
         appId, filename.c_str(), cleanName.c_str(), fileSize, urlHost.c_str(), urlPath.c_str());
