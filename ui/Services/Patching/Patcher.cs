@@ -982,7 +982,7 @@ namespace CloudRedirect.Services.Patching
 
             var textSec = PeSection.Find(sections, ".text");
 
-            var knownNames = new HashSet<string> { ".text", ".rdata", ".data", ".pdata", ".fptable", ".rsrc", ".reloc" };
+            var knownNames = new HashSet<string> { ".text", ".rdata", ".data", ".pdata", ".fptable", ".rsrc", ".reloc", ".idata" };
             PeSection? obfSec = null;
             foreach (var sec in sections)
             {
@@ -993,17 +993,84 @@ namespace CloudRedirect.Services.Patching
                 }
             }
 
-            if (textSec == null || obfSec == null)
+            if (textSec == null)
             {
-                Log("  Payload: missing expected sections");
+                Log("  Payload: missing .text section");
                 return false;
             }
 
             tStart = (int)textSec.Value.RawOffset;
             tEnd = Math.Min(tStart + (int)textSec.Value.RawSize, payload.Length);
-            gStart = (int)obfSec.Value.RawOffset;
-            gEnd = Math.Min(gStart + (int)obfSec.Value.RawSize, payload.Length);
+            if (obfSec != null)
+            {
+                gStart = (int)obfSec.Value.RawOffset;
+                gEnd = Math.Min(gStart + (int)obfSec.Value.RawSize, payload.Length);
+            }
+            else
+            {
+                gStart = tStart;
+                gEnd = tEnd;
+            }
             return true;
+        }
+
+        const uint SCN_MEM_EXECUTE = 0x20000000;
+
+        int EnsureExecutableCave(byte[] payload, PeSection[] sections, int requiredSize)
+        {
+            var peOff = BitConverter.ToInt32(payload, 0x3C);
+            ushort numSections = BitConverter.ToUInt16(payload, peOff + 6);
+            ushort optHdrSize = BitConverter.ToUInt16(payload, peOff + 20);
+            int secHdrStart = peOff + 24 + optHdrSize;
+            int sectionAlignment = BitConverter.ToInt32(payload, peOff + 0x38);
+
+            // Find a read-only section with alignment padding after VSize, extend
+            // VSize to cover the cave, and add EXECUTE.
+            for (int s = 0; s < numSections; s++)
+            {
+                int hdrOff = secHdrStart + s * 40;
+                uint chars = BitConverter.ToUInt32(payload, hdrOff + 36);
+                if ((chars & SCN_MEM_EXECUTE) != 0)
+                    continue;
+                if ((chars & 0x80000000) != 0) // skip writable sections
+
+                    continue;
+
+                int va = BitConverter.ToInt32(payload, hdrOff + 12);
+                int vSize = BitConverter.ToInt32(payload, hdrOff + 8);
+
+                int alignedEnd = ((va + vSize) + sectionAlignment - 1) & ~(sectionAlignment - 1);
+                int padGap = alignedEnd - (va + vSize);
+
+                if (padGap < requiredSize)
+                    continue;
+
+                int caveRva = va + vSize;
+                int newVSize = vSize + requiredSize;
+                BitConverter.GetBytes(newVSize).CopyTo(payload, hdrOff + 8);
+                uint newChars = chars | SCN_MEM_EXECUTE;
+                BitConverter.GetBytes(newChars).CopyTo(payload, hdrOff + 36);
+
+                int rawOff = BitConverter.ToInt32(payload, hdrOff + 20);
+                int rawSize = BitConverter.ToInt32(payload, hdrOff + 16);
+                int caveFileOff = rawOff + (caveRva - va);
+
+                if (caveFileOff + requiredSize > rawOff + rawSize)
+                {
+                    if (caveFileOff + requiredSize > payload.Length)
+                        continue;
+                    int newRawSize = ((caveRva - va) + requiredSize + 0x1FF) & ~0x1FF;
+                    BitConverter.GetBytes(newRawSize).CopyTo(payload, hdrOff + 16);
+                }
+
+                string secName = System.Text.Encoding.ASCII.GetString(payload, hdrOff, 8).TrimEnd('\0');
+                Log($"  Cave target: section '{secName}' padding gap ({padGap} bytes)");
+                Log($"    VSize 0x{vSize:X} -> 0x{newVSize:X}, Chars 0x{chars:X8} -> 0x{newChars:X8}");
+                Log($"    Cave RVA 0x{caveRva:X}, file offset 0x{caveFileOff:X}");
+
+                return caveFileOff;
+            }
+            return -1;
         }
 
         PatchEntry[] ResolvePayloadPatchOffsets(byte[] payload)
@@ -1011,6 +1078,12 @@ namespace CloudRedirect.Services.Patching
             if (!ResolvePayloadSections(payload, out _, out int tStart, out int tEnd, out int gStart, out int gEnd))
                 return null;
 
+            var result = Signatures.ResolvePatternGroup(payload, Signatures.PayloadP123DefsV2,
+                tStart, tEnd, gStart, gEnd, _verbose ? _log : null);
+            if (result != null)
+                return result;
+
+            Log("  V2 P1/P2/P3 failed, trying V1 fallback...");
             return Signatures.ResolvePatternGroup(payload, Signatures.PayloadP123Defs,
                 tStart, tEnd, gStart, gEnd, _verbose ? _log : null);
         }
@@ -1020,7 +1093,13 @@ namespace CloudRedirect.Services.Patching
             if (!ResolvePayloadSections(payload, out _, out int tStart, out int tEnd, out int gStart, out int gEnd))
                 return null;
 
-            return Signatures.ResolvePatternGroup(payload, Signatures.PayloadSetupDefs,
+            var result = Signatures.ResolvePatternGroup(payload, Signatures.PayloadSetupDefs,
+                tStart, tEnd, gStart, gEnd, _verbose ? _log : null);
+            if (result != null)
+                return result;
+
+            Log("  V2 setup defs failed, trying V1 fallback...");
+            return Signatures.ResolvePatternGroup(payload, Signatures.PayloadSetupDefsV1,
                 tStart, tEnd, gStart, gEnd, _verbose ? _log : null);
         }
 
@@ -1071,8 +1150,13 @@ namespace CloudRedirect.Services.Patching
                 caveFileOffset = Signatures.FindCodeCave(payload, sections, CloudRedirectCaveContent.Length);
                 if (caveFileOffset < 0)
                 {
-                    Log("  Payload: could not find code cave in any executable section");
-                    return null;
+                    caveFileOffset = EnsureExecutableCave(payload, sections, CloudRedirectCaveContent.Length);
+                    if (caveFileOffset < 0)
+                    {
+                        Log("  Payload: could not find code cave in any executable section");
+                        return null;
+                    }
+                    Log($"  Payload: EnsureExecutableCave at 0x{caveFileOffset:X}");
                 }
             }
 

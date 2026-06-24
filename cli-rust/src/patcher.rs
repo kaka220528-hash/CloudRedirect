@@ -383,33 +383,36 @@ impl Patcher {
     /// Resolve payload section bounds: .text and the first non-standard ("obf") section.
     fn resolve_payload_sections(&self, payload: &[u8]) -> Option<(i64, i64, i64, i64)> {
         let sections = PeSection::parse(payload);
-        let text = PeSection::find(&sections, ".text");
+        let text = PeSection::find(&sections, ".text")?;
 
-        const KNOWN: [&str; 7] = [
-            ".text", ".rdata", ".data", ".pdata", ".fptable", ".rsrc", ".reloc",
+        const KNOWN: [&str; 8] = [
+            ".text", ".rdata", ".data", ".pdata", ".fptable", ".rsrc", ".reloc", ".idata",
         ];
         let obf = sections.iter().find(|s| !KNOWN.contains(&s.name.as_str()));
 
-        let (text, obf) = match (text, obf) {
-            (Some(t), Some(o)) => (t, o),
-            _ => {
-                self.log("  Payload: missing expected sections");
-                return None;
-            }
-        };
-
         let t_start = text.raw_offset as i64;
         let t_end = (t_start + text.raw_size as i64).min(payload.len() as i64);
-        let g_start = obf.raw_offset as i64;
-        let g_end = (g_start + obf.raw_size as i64).min(payload.len() as i64);
+        // Fall back to .text bounds if no obfuscated section.
+        let (g_start, g_end) = match obf {
+            Some(o) => {
+                let s = o.raw_offset as i64;
+                (s, (s + o.raw_size as i64).min(payload.len() as i64))
+            }
+            None => (t_start, t_end),
+        };
         Some((t_start, t_end, g_start, g_end))
     }
 
     fn resolve_setup_patch_offsets(&self, payload: &[u8]) -> Option<Vec<PatchEntry>> {
         let (t_start, t_end, g_start, g_end) = self.resolve_payload_sections(payload)?;
         let mut log = |m: &str| println!("{}", m);
-        let defs = signatures::payload_setup_defs();
-        signatures::resolve_pattern_group(payload, &defs, t_start, t_end, g_start, g_end, &mut log)
+        // V2 first, V1 fallback.
+        let new_defs = signatures::payload_setup_defs();
+        if let Some(r) = signatures::resolve_pattern_group(payload, &new_defs, t_start, t_end, g_start, g_end, &mut log) {
+            return Some(r);
+        }
+        let old_defs = signatures::payload_setup_defs_v1();
+        signatures::resolve_pattern_group(payload, &old_defs, t_start, t_end, g_start, g_end, &mut log)
     }
 
     /// Read + AES-decrypt + zlib-inflate the payload cache. Returns (payload, iv).
